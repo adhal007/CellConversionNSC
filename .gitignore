@@ -1,0 +1,9 @@
+*peaks*
+*log* 
+*png*
+*jpg*
+*.ipynb_checkpoints
+.DS_Store
+__pycache__/
+*.pyc
+.env
