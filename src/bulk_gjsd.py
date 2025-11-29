@@ -7,14 +7,14 @@ from multiprocessing import Pool
 from tqdm import tqdm
 
 
-# %% Fixed BulkGJSD class
+# Modified BulkGJSD class with better zero-variance handling
 class BulkGJSD:
     def __init__(self, counts_df: pd.DataFrame, n_processes: int = 4):
         self.counts = counts_df
         self.n_processes = n_processes
     
     def compare(self, target_samples: List[str], other_samples: List[str], 
-                method: str = 'geometric_jsd') -> pd.DataFrame:
+                method: str = 'gaussian_gjsd') -> pd.DataFrame:
         
         X_target = self.counts[target_samples].values.T
         X_other = self.counts[other_samples].values.T
@@ -22,14 +22,40 @@ class BulkGJSD:
         n_target = len(target_samples)
         n_other = len(other_samples)
         
+        # Calculate mean and variance for other samples
         mu_other = X_other.mean(axis=0)
         var_other = X_other.var(axis=0, ddof=1) if n_other > 1 else mu_other
+        
+        # Calculate mean and variance for target samples
+        mu_target = X_target.mean(axis=0)
+        var_target = X_target.var(axis=0, ddof=1) if n_target > 1 else mu_target
+        
+        # Calculate fallback variance: mean of variances where expression > 0
+        # For target: use genes where target mean > 0
+        target_expressed_mask = mu_target > 0
+        if target_expressed_mask.sum() > 0:
+            var_fallback_target = np.mean(var_target[target_expressed_mask])
+        else:
+            var_fallback_target = 0.1  # Ultimate fallback
+        
+        # For other: use genes where other mean > 0
+        other_expressed_mask = mu_other > 0
+        if other_expressed_mask.sum() > 0:
+            var_fallback_other = np.mean(var_other[other_expressed_mask])
+        else:
+            var_fallback_other = 0.1  # Ultimate fallback
+        
+        print(f"Variance fallback - Target: {var_fallback_target:.4f}, Other: {var_fallback_other:.4f}")
         
         gene_data_list = []
         for i, gene in enumerate(self.counts.index):
             target_expr = X_target[:, i]
             if method in ('gaussian_gjsd', 'extended_gjsd'):
-                gene_data_list.append((gene, target_expr, n_target, mu_other[i], var_other[i]))
+                gene_data_list.append((
+                    gene, target_expr, n_target, 
+                    mu_other[i], var_other[i],
+                    var_fallback_target, var_fallback_other
+                ))
             else:
                 gene_data_list.append((gene, target_expr, n_target, mu_other[i]))
         
@@ -48,30 +74,34 @@ class BulkGJSD:
         df['log2FC'] = np.log2((df['mean_target'] + 1) / (df['mean_other'] + 1))
         df = df.set_index('gene')
         
-        # Lower score = more specific for all methods
-        df = df.sort_values('gjsd_score', ascending=True)
+        # Higher score = more specific (sort descending)
+        df = df.sort_values('gjsd_score', ascending=False)
         
         return df
     
     @staticmethod
-    def _compute_gjsd_single(gene_data: Tuple, method: str = 'geometric_jsd') -> Tuple[str, float]:
+    def _compute_gjsd_single(gene_data: Tuple, method: str = 'gaussian_gjsd') -> Tuple[str, float]:
         
         eps = 1e-12
         
         if len(gene_data) == 4:
             gene_name, target_expr, n_target, mu_other = gene_data
             var_other_provided = None
-        else:
+            var_fallback_target = 0.1
+            var_fallback_other = 0.1
+        elif len(gene_data) == 5:
             gene_name, target_expr, n_target, mu_other, var_other_provided = gene_data
+            var_fallback_target = 0.1
+            var_fallback_other = 0.1
+        else:
+            gene_name, target_expr, n_target, mu_other, var_other_provided, var_fallback_target, var_fallback_other = gene_data
         
         target_expr = np.asarray(target_expr, dtype=float)
         if len(target_expr) != n_target:
             n_target = len(target_expr)
         
-        score_sum = 0.0
-        
         # =====================================================================
-        # GAUSSIAN CLOSED-FORM METHODS (Nielsen 2025)
+        # GAUSSIAN CLOSED-FORM METHODS (Nielsen 2019)
         # =====================================================================
         if method in ('gaussian_gjsd', 'extended_gjsd'):
             
@@ -80,21 +110,21 @@ class BulkGJSD:
             if n_target >= 2:
                 var_target = float(np.var(target_expr, ddof=1))
             else:
-                var_target = max(mu_target, eps)
+                var_target = var_fallback_target
             
-            var_target = max(var_target, eps)
+            # Use fallback variance if variance is 0 (gene not expressed)
+            if var_target < eps:
+                var_target = var_fallback_target
             
             mu_other_val = float(mu_other)
             
             if var_other_provided is not None:
-                var_other = max(float(var_other_provided), eps)
+                var_other = float(var_other_provided)
+                # Use fallback variance if variance is 0
+                if var_other < eps:
+                    var_other = var_fallback_other
             else:
-                if mu_target > eps:
-                    cv_target = np.sqrt(var_target) / mu_target
-                    var_other = (cv_target * max(mu_other_val, eps)) ** 2
-                    var_other = max(var_other, eps)
-                else:
-                    var_other = var_target
+                var_other = var_fallback_other
             
             v1, v2 = var_target, var_other
             mu1, mu2 = mu_target, mu_other_val
@@ -115,23 +145,19 @@ class BulkGJSD:
                 0.5 * np.log(var_sum / (2.0 * np.sqrt(v1 * v2)))
             )
             
-            gjsd = 0.5 * jeffreys - bhattacharyya
+            # G-JSD = (1/4)*Jeffreys - Bhattacharyya (Nielsen 2019, Prop 15)
+            gjsd = 0.25 * jeffreys - bhattacharyya
             gjsd = max(0.0, gjsd)
             
             if not np.isfinite(gjsd):
                 gjsd = 0.0
             
-            # Scale by n_target, return 1/gjsd so lower = more specific
-            if gjsd > eps:
-                score_sum = (1.0 / gjsd) * n_target
-            else:
-                score_sum = float('inf')
-            
-            return gene_name, float(score_sum)
+            return gene_name, float(gjsd)
         
         # =====================================================================
-        # DISCRETE PER-SAMPLE METHODS
+        # DISCRETE PER-SAMPLE METHODS (unchanged)
         # =====================================================================
+        score_sum = 0.0
         for i in range(n_target):
             x = float(target_expr[i])
             denom = x + mu_other
@@ -179,3 +205,5 @@ class BulkGJSD:
                 score_sum += max(0.0, score)
         
         return gene_name, float(score_sum)
+
+
