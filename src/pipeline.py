@@ -24,22 +24,23 @@ class NSCAnalysis:
         1. What are pro-neural and pro-glial signatures?
         2. What factors can convert glial to neuronal?
     """
-    ### Parsers and loaders #################################################
     def __init__(
         self,
         counts_path: str,
         metadata_path: str,
+        atac_metadata_path: str,  # <-- NEW
         overlap_df_path: str,
         chip_annotated_path: str,
         atac_annotated_path: str,
         tf_list_path: str,
-        gtf_path: str, 
-        exclude_samples: Optional[List[str]] = None
+        gtf_path: str,
+        exclude_samples: List[str] = None
     ):
         # Store paths
         self.paths = {
             'counts': Path(counts_path),
             'metadata': Path(metadata_path),
+            'atac_metadata': Path(atac_metadata_path),  # <-- NEW
             'overlap_df': Path(overlap_df_path),
             'chip_annotated': Path(chip_annotated_path),
             'atac_annotated': Path(atac_annotated_path),
@@ -47,34 +48,138 @@ class NSCAnalysis:
             'gtf': Path(gtf_path)
         }
         
-        # Store exclude list
-        self.exclude_samples = exclude_samples or []
-        
         # Validate paths exist
         for name, path in self.paths.items():
             if not path.exists():
                 raise FileNotFoundError(f"{name}: {path}")
         
-        # Data containers (populated by _load_data)
+        # Store exclude list
+        self.exclude_samples = exclude_samples or []
+        
+        # Data containers
         self.counts = None
         self.counts_unfiltered = None
         self.metadata = None
+        self.atac_metadata = None  # <-- NEW
+        self.merged_metadata = None  # <-- NEW
+        self.atac_to_rna_map = None  # <-- NEW
         self.overlap_df = None
         self.chip_annotated = None
         self.atac_annotated = None
         self.tf_symbols = None
-        self.gene_id_to_symbol = None
+        self.tf_ensembl = None
+        self.ensembl_to_symbol = None
         
         # Results containers
         self.deseq_results = None
         self.gjsd_results = None
-        self.diff_atac = None
-        self.grn = None
+        self.dar_results = None
+        self.consensus_peaks = None
+        self.atac_signal_matrix = None
+        self.diff_overlap_df = None
         self.gene_lengths = None
         self.tpm = None
         self.fpkm = None
+        
         # Load data
         self._load_data()
+
+
+    def _load_data(self):
+        """Load all input data."""
+        print("=" * 60)
+        print("Loading data...")
+        print("=" * 60)
+        
+        # 1. Load counts
+        print("\n[1/9] Loading counts...")
+        self.counts = pd.read_csv(self.paths['counts'], sep=';', index_col=1)
+        self.counts = self.counts.drop(columns=['Unnamed: 0'])
+        
+        nan_genes = self.counts.isna().any(axis=1).sum()
+        if nan_genes > 0:
+            print(f"      Dropping {nan_genes} genes with NaN values")
+            self.counts = self.counts.dropna()
+        
+        print(f"      {self.counts.shape[0]} genes x {self.counts.shape[1]} samples")
+        
+        # 2. Load RNA-seq metadata
+        print("\n[2/9] Loading RNA-seq metadata...")
+        self.metadata = pd.read_csv(self.paths['metadata'], sep=';')
+        self.metadata = self.metadata.set_index('SampleID')
+        print(f"      {self.metadata.shape[0]} samples")
+        print(f"      Columns: {list(self.metadata.columns)}")
+        
+        # 3. Load ATAC-seq metadata
+        print("\n[3/9] Loading ATAC-seq metadata...")
+        self.atac_metadata = pd.read_csv(self.paths['atac_metadata'], sep=',')
+        self.atac_metadata = self.atac_metadata.set_index('SampleID')
+        print(f"      {self.atac_metadata.shape[0]} samples")
+        print(f"      Columns: {list(self.atac_metadata.columns)}")
+        
+        # 4. Create merged metadata and mapping
+        print("\n[4/9] Creating ATAC-to-RNA sample mapping...")
+        self._create_sample_mapping()
+        
+        # 5. Remove outlier samples
+        if self.exclude_samples:
+            print(f"\n[5/9] Removing outlier samples...")
+            samples_to_remove = [s for s in self.exclude_samples if s in self.counts.columns]
+            if samples_to_remove:
+                self.counts = self.counts.drop(columns=samples_to_remove)
+                self.metadata = self.metadata.drop(index=[s for s in samples_to_remove if s in self.metadata.index])
+                print(f"      Removed: {samples_to_remove}")
+                print(f"      Remaining: {self.counts.shape[1]} samples")
+            else:
+                print(f"      No matching samples found to remove")
+        else:
+            print("\n[5/9] No outlier samples to remove")
+        
+        # 6. Filter low-count genes
+        print("\n[6/9] Filtering low-count genes...")
+        self._filter_low_counts(min_counts=10, min_samples=3, group_col='Stage')
+        
+        # 7. Load overlap_df
+        print("\n[7/9] Loading overlap_df (ChIP ∩ ATAC)...")
+        self.overlap_df = pd.read_csv(self.paths['overlap_df'], sep='\t')
+        print(f"      {self.overlap_df.shape[0]} overlaps")
+        print(f"      Columns: {list(self.overlap_df.columns)}")
+        
+        # 8. Load chip_annotated
+        print("\n[8/9] Loading chip_annotated...")
+        self.chip_annotated = pd.read_csv(self.paths['chip_annotated'], sep='\t')
+        print(f"      {self.chip_annotated.shape[0]} peaks")
+        
+        # 9. Load atac_annotated
+        print("\n[9/9] Loading atac_annotated...")
+        self.atac_annotated = pd.read_csv(self.paths['atac_annotated'], sep='\t')
+        print(f"      {self.atac_annotated.shape[0]} peaks")
+        
+        # 10. Load TF list
+        print("\n[10/10] Loading TF list...")
+        tf_df = pd.read_excel(self.paths['tf_list'])
+        tf_df = tf_df.dropna()
+        tf_df.columns = tf_df.iloc[0, :]
+        tf_df = tf_df.iloc[1:, :].reset_index(drop=True)
+        self.tf_df = tf_df
+        self.tf_symbols = set(tf_df['Gene Symbol'].str.strip().tolist())
+        self.tf_ensembl = set(tf_df['Ensembl ID'].str.strip().tolist())
+        print(f"      {len(self.tf_symbols)} TFs")
+        
+        # Check TFs remaining after filtering
+        tfs_in_counts = len([g for g in self.counts.index if g in self.tf_ensembl])
+        print(f"      TFs in filtered counts: {tfs_in_counts}")
+        
+        # 11. Parse GTF for gene mappings
+        print("\n[11/11] Parsing GTF for gene symbol mappings...")
+        self.ensembl_to_symbol = self._parse_gtf_gene_mapping()
+        
+        mapped = sum(1 for g in self.counts.index if g in self.ensembl_to_symbol)
+        print(f"      Counts genes with mapping: {mapped} / {len(self.counts)}")
+        
+        print("\n" + "=" * 60)
+        print("Data loaded successfully!")
+        print("=" * 60)
 
     def _filter_low_counts(
         self,
@@ -164,140 +269,61 @@ class NSCAnalysis:
             tfs_before = len([g for g in self.counts_unfiltered.index if g in self.tf_ensembl])
             tfs_after = len([g for g in self.counts.index if g in self.tf_ensembl])
             print(f"TFs before: {tfs_before}, after: {tfs_after}")
+
+    def _create_sample_mapping(self):
+        """
+        Create mapping between ATAC and RNA sample IDs based on 
+        Stage, Region, Marker, and Replicate.
+        """
+        # Standardize ATAC metadata columns to match RNA naming
+        atac = self.atac_metadata.copy()
         
-        return self.counts
-    # Update _load_data method:
-    def _load_data(self):
-        """Load all input data."""
-        print("=" * 60)
-        print("Loading data...")
-        print("=" * 60)
+        # Map ATAC column names to RNA column names
+        # ATAC: Tissue, Factor, Condition, Replicate
+        # RNA: Region, Marker, Stage, Replicate
         
-        # 1. Load counts (semicolon-separated, gene IDs in column 1)
-        print("\n[1/7] Loading counts...")
-        self.counts = pd.read_csv(self.paths['counts'], sep=';', index_col=1)
-        self.counts = self.counts.drop(columns=['Unnamed: 0'])
+        # Tissue -> Region
+        atac['Region'] = atac['Tissue'].map({'Cortex': 'Ctx', 'LGE': 'LGE'})
         
-        # Drop genes with NaN values
-        nan_genes = self.counts.isna().any(axis=1).sum()
-        if nan_genes > 0:
-            print(f"      Dropping {nan_genes} genes with NaN values")
-            self.counts = self.counts.dropna()
+        # Factor -> Marker
+        atac['Marker'] = atac['Factor'].map({'CD133': 'Progenitors', 'PSA-NCAM': 'PSANCAM'})
         
-        print(f"      {self.counts.shape[0]} genes x {self.counts.shape[1]} samples")
+        # Condition -> Stage
+        atac['Stage'] = atac['Condition']
         
-        # 2. Load metadata (semicolon-separated)
-        print("\n[2/7] Loading metadata...")
-        self.metadata = pd.read_csv(self.paths['metadata'], sep=';')
-        self.metadata = self.metadata.set_index('SampleID')
-        print(f"      {self.metadata.shape[0]} samples")
-        print(f"      Columns: {list(self.metadata.columns)}")
+        # Build mapping
+        self.atac_to_rna_map = {}
+        unmatched = []
         
-        # 3. Remove outlier samples  <-- ADD THIS BLOCK
-        if self.exclude_samples:
-            print(f"\n[3/8] Removing outlier samples...")
-            samples_to_remove = [s for s in self.exclude_samples if s in self.counts.columns]
-            if samples_to_remove:
-                self.counts = self.counts.drop(columns=samples_to_remove)
-                self.metadata = self.metadata.drop(index=[s for s in samples_to_remove if s in self.metadata.index])
-                print(f"      Removed: {samples_to_remove}")
-                print(f"      Remaining: {self.counts.shape[1]} samples")
+        for atac_id in atac.index:
+            atac_row = atac.loc[atac_id]
+            
+            match = self.metadata[
+                (self.metadata['Stage'] == atac_row['Stage']) &
+                (self.metadata['Region'] == atac_row['Region']) &
+                (self.metadata['Marker'] == atac_row['Marker']) &
+                (self.metadata['Replicate'] == atac_row['Replicate'])
+            ]
+            
+            if len(match) == 1:
+                self.atac_to_rna_map[atac_id] = match.index[0]
+            elif len(match) > 1:
+                print(f"      Warning: Multiple matches for {atac_id}")
+                self.atac_to_rna_map[atac_id] = match.index[0]  # Take first
             else:
-                print(f"      No matching samples found to remove")
-                
-        # --- ADD FILTERING HERE ---
-        # 3. Filter low-count genes
-        print("\n[3/7] Filtering low-count genes...")
-        self._filter_low_counts(min_counts=10, min_samples=3, group_col='Stage')
+                unmatched.append(atac_id)
         
-        # 4. Load overlap_df
-        print("\n[4/7] Loading overlap_df (ChIP ∩ ATAC)...")
-        self.overlap_df = pd.read_csv(self.paths['overlap_df'], sep='\t')
-        print(f"      {self.overlap_df.shape[0]} overlaps")
-        print(f"      Columns: {list(self.overlap_df.columns)}")
+        print(f"      Mapped: {len(self.atac_to_rna_map)} / {len(atac)} ATAC samples")
+        if unmatched:
+            print(f"      Unmatched ATAC samples: {unmatched}")
         
-        # 5. Load chip_annotated
-        print("\n[5/7] Loading chip_annotated...")
-        self.chip_annotated = pd.read_csv(self.paths['chip_annotated'], sep='\t')
-        print(f"      {self.chip_annotated.shape[0]} peaks")
+        # Create merged metadata
+        atac['RNA_SampleID'] = atac.index.map(self.atac_to_rna_map)
+        self.merged_metadata = atac
         
-        # 6. Load atac_annotated
-        print("\n[6/7] Loading atac_annotated...")
-        self.atac_annotated = pd.read_csv(self.paths['atac_annotated'], sep='\t')
-        print(f"      {self.atac_annotated.shape[0]} peaks")
-        
-        # 7. Load TF list
-        print("\n[7/7] Loading TF list...")
-        tf_df = pd.read_excel(self.paths['tf_list'])
-        tf_df = tf_df.dropna()
-        tf_df.columns = tf_df.iloc[0, :]
-        tf_df = tf_df.iloc[1:, :].reset_index(drop=True)
-        self.tf_df = tf_df
-        self.tf_symbols = set(tf_df['Gene Symbol'].str.strip().tolist())
-        self.tf_ensembl = set(tf_df['Ensembl ID'].str.strip().tolist())
-        print(f"      {len(self.tf_symbols)} TFs")
-        
-        # 8. Parse GTF for gene mappings
-        print("\n[8/8] Parsing GTF for gene symbol mappings...")
-        self.ensembl_to_symbol = self._parse_gtf_gene_mapping()
-        
-        # Check coverage
-        mapped = sum(1 for g in self.counts.index if g in self.ensembl_to_symbol)
-        print(f"      Counts genes with mapping: {mapped} / {len(self.counts)}")
-        
-        print("\n" + "=" * 60)
-        print("Data loaded successfully!")
-        print("=" * 60)
-
-    def load_gene_lengths(self, gtf_path: str):
-        """Load gene lengths from GTF."""
-        self.gene_lengths = self.get_gene_lengths_from_gtf(gtf_path)
-        print(f"Loaded lengths for {len(self.gene_lengths)} genes")
-        
-        # Check overlap with counts
-        overlap = self.counts.index.intersection(self.gene_lengths.index)
-        print(f"Genes in counts with length info: {len(overlap)}/{len(self.counts)}")
+        # Store reverse mapping too
+        self.rna_to_atac_map = {v: k for k, v in self.atac_to_rna_map.items()}
     
-    def normalize_counts(self, method: str = 'tpm') -> pd.DataFrame:
-        """
-        Normalize counts to TPM or FPKM.
-        
-        Args:
-            method: 'tpm', 'fpkm', or 'vst'
-            
-        Returns:
-            Normalized count matrix
-        """
-        if method in ['tpm', 'fpkm'] and self.gene_lengths is None:
-            raise ValueError("Load gene lengths first with load_gene_lengths()")
-        
-        if method == 'tpm':
-            self.tpm = self.calculate_tpm(self.counts, self.gene_lengths)
-            return self.tpm
-        
-        elif method == 'fpkm':
-            self.fpkm = self.calculate_fpkm(self.counts, self.gene_lengths)
-            return self.fpkm
-        
-        elif method == 'vst':
-
-            
-            dds = DeseqDataSet(
-                counts=self.counts.T,
-                metadata=self.metadata,
-                design="~1"
-            )
-            vst = deseq2_norm_transform(dds)
-            self.vst = pd.DataFrame(
-                vst.T, 
-                index=self.counts.index, 
-                columns=self.counts.columns
-            )
-            return self.vst
-        
-        else:
-            raise ValueError(f"Unknown method: {method}. Use 'tpm', 'fpkm', or 'vst'")    
-        
     def summary(self):
         """Print summary of loaded data."""
         print("\n=== NSCAnalysis Summary ===")
@@ -1047,178 +1073,11 @@ class NSCAnalysis:
             f'{group1}_specific': g1_df,
             f'{group2}_specific': g2_df
         }
-    
-    def get_candidates_with_binding(
-        self,
-        gjsd_results: Dict[str, pd.DataFrame],
-        overlap_df: pd.DataFrame,
-        ensembl_to_symbol: Dict[str, str],
-        padj_thresh: float = 0.05,
-        lfc_thresh: float = 1.0,
-        gjsd_percentile: float = 95,
-        group1: str = 'E14',
-        group2: str = 'E18'
-    ) -> Dict[str, pd.DataFrame]:
-        """
-        Step 2: Get candidate TFs and genes, then filter by binding evidence.
-        
-        With contrast [group1, group2]:
-            - Positive log2FC = higher in group1 (E14)
-            - Negative log2FC = higher in group2 (E18)
-        """
-        print(f"\n{'='*60}")
-        print("Step 2: Filter candidates by binding evidence")
-        print(f"{'='*60}")
-        
-        all_results = gjsd_results['all'].copy()
-        
-        # Add symbol if not present
-        if 'symbol' not in all_results.columns:
-            all_results['symbol'] = [ensembl_to_symbol.get(g, g) for g in all_results.index]
-        
-        # Calculate gJSD thresholds
-        gjsd_thresh_tf = np.percentile(
-            all_results[all_results['is_TF']]['gjsd_score'].dropna(), 
-            gjsd_percentile
-        )
-        gjsd_thresh_gene = np.percentile(
-            all_results[~all_results['is_TF']]['gjsd_score'].dropna(), 
-            gjsd_percentile
-        )
-        
-        print(f"\nThresholds:")
-        print(f"  padj < {padj_thresh}")
-        print(f"  |log2FC| > {lfc_thresh}")
-        print(f"  gJSD (TF) > {gjsd_thresh_tf:.4f} (p{gjsd_percentile})")
-        print(f"  gJSD (Gene) > {gjsd_thresh_gene:.4f} (p{gjsd_percentile})")
-        
-        # =========================================================================
-        # STEP 2a: Get candidate TFs and genes by expression
-        # =========================================================================
-        
-        # Positive log2FC = group1-high (E14)
-        # Negative log2FC = group2-high (E18)
-        
-        # TFs
-        g1_tfs = all_results[
-            (all_results['padj'] < padj_thresh) & 
-            (all_results['log2FoldChange'] > lfc_thresh) & 
-            (all_results['is_TF'] == True) &
-            (all_results['gjsd_score'] >= gjsd_thresh_tf)
-        ].copy()
-        
-        g2_tfs = all_results[
-            (all_results['padj'] < padj_thresh) & 
-            (all_results['log2FoldChange'] < -lfc_thresh) & 
-            (all_results['is_TF'] == True) &
-            (all_results['gjsd_score'] >= gjsd_thresh_tf)
-        ].copy()
-        
-        # Genes
-        g1_genes = all_results[
-            (all_results['padj'] < padj_thresh) & 
-            (all_results['log2FoldChange'] > lfc_thresh) & 
-            (all_results['is_TF'] == False) &
-            (all_results['gjsd_score'] >= gjsd_thresh_gene)
-        ].copy()
-        
-        g2_genes = all_results[
-            (all_results['padj'] < padj_thresh) & 
-            (all_results['log2FoldChange'] < -lfc_thresh) & 
-            (all_results['is_TF'] == False) &
-            (all_results['gjsd_score'] >= gjsd_thresh_gene)
-        ].copy()
-        
-        print(f"\n=== Candidates by expression + gJSD ===")
-        print(f"{group1}-high TFs: {len(g1_tfs)}")
-        print(f"{group2}-high TFs: {len(g2_tfs)}")
-        print(f"{group1}-high genes: {len(g1_genes)}")
-        print(f"{group2}-high genes: {len(g2_genes)}")
-        
-        # =========================================================================
-        # STEP 2b: Get unique TFs and genes from overlap_df
-        # =========================================================================
-        
-        tfs_in_overlap = set(overlap_df['TF'].unique())
-        genes_in_overlap = set(overlap_df['gene'].unique())
-        
-        g1_binding_tfs = set(overlap_df[overlap_df['condition'] == group1]['TF'].unique())
-        g2_binding_tfs = set(overlap_df[overlap_df['condition'] == group2]['TF'].unique())
-        
-        g1_binding_genes = set(overlap_df[overlap_df['condition'] == group1]['gene'].unique())
-        g2_binding_genes = set(overlap_df[overlap_df['condition'] == group2]['gene'].unique())
-        
-        print(f"\n=== Binding evidence in overlap_df ===")
-        print(f"Total TFs with ChIP evidence: {len(tfs_in_overlap)}")
-        print(f"Total target genes with ATAC evidence: {len(genes_in_overlap)}")
-        print(f"TFs with {group1} binding: {len(g1_binding_tfs)}")
-        print(f"TFs with {group2} binding: {len(g2_binding_tfs)}")
-        
-        # =========================================================================
-        # STEP 2c: Filter candidates by binding evidence
-        # =========================================================================
-        
-        g1_tfs_with_binding = g1_tfs[g1_tfs['symbol'].isin(tfs_in_overlap)].copy()
-        g2_tfs_with_binding = g2_tfs[g2_tfs['symbol'].isin(tfs_in_overlap)].copy()
-        
-        g1_tfs_with_g1_binding = g1_tfs[g1_tfs['symbol'].isin(g1_binding_tfs)].copy()
-        g2_tfs_with_g2_binding = g2_tfs[g2_tfs['symbol'].isin(g2_binding_tfs)].copy()
-        
-        g1_genes_with_binding = g1_genes[g1_genes['symbol'].isin(genes_in_overlap)].copy()
-        g2_genes_with_binding = g2_genes[g2_genes['symbol'].isin(genes_in_overlap)].copy()
-        
-        g1_genes_with_g1_access = g1_genes[g1_genes['symbol'].isin(g1_binding_genes)].copy()
-        g2_genes_with_g2_access = g2_genes[g2_genes['symbol'].isin(g2_binding_genes)].copy()
-        
-        print(f"\n=== Candidates with binding evidence ===")
-        print(f"{group1}-high TFs with ChIP evidence: {len(g1_tfs_with_binding)}")
-        print(f"{group1}-high TFs with {group1} binding: {len(g1_tfs_with_g1_binding)}")
-        print(f"{group2}-high TFs with ChIP evidence: {len(g2_tfs_with_binding)}")
-        print(f"{group2}-high TFs with {group2} binding: {len(g2_tfs_with_g2_binding)}")
-        print(f"{group1}-high genes with ATAC evidence: {len(g1_genes_with_binding)}")
-        print(f"{group2}-high genes with ATAC evidence: {len(g2_genes_with_binding)}")
-        
-        # =========================================================================
-        # STEP 2d: Show top candidates
-        # =========================================================================
-        
-        print(f"\n=== Top {group1}-high TFs (to UPREGULATE for neurogenesis) ===")
-        if len(g1_tfs_with_binding) > 0:
-            top_g1 = g1_tfs_with_binding.nlargest(10, 'gjsd_score')
-            print(top_g1[['symbol', 'log2FoldChange', 'padj', 'gjsd_score']].to_string())
-        
-        print(f"\n=== Top {group2}-high TFs (to DOWNREGULATE for neurogenesis) ===")
-        if len(g2_tfs_with_binding) > 0:
-            top_g2 = g2_tfs_with_binding.nlargest(10, 'gjsd_score')
-            print(top_g2[['symbol', 'log2FoldChange', 'padj', 'gjsd_score']].to_string())
-        
-        return {
-            f'{group1}_TFs': g1_tfs,
-            f'{group2}_TFs': g2_tfs,
-            f'{group1}_genes': g1_genes,
-            f'{group2}_genes': g2_genes,
-            f'{group1}_TFs_with_binding': g1_tfs_with_binding,
-            f'{group2}_TFs_with_binding': g2_tfs_with_binding,
-            f'{group1}_genes_with_binding': g1_genes_with_binding,
-            f'{group2}_genes_with_binding': g2_genes_with_binding,
-            f'{group1}_TFs_with_{group1}_binding': g1_tfs_with_g1_binding,
-            f'{group2}_TFs_with_{group2}_binding': g2_tfs_with_g2_binding,
-            f'{group1}_genes_with_{group1}_access': g1_genes_with_g1_access,
-            f'{group2}_genes_with_{group2}_access': g2_genes_with_g2_access,
-            'tfs_in_overlap': tfs_in_overlap,
-            'genes_in_overlap': genes_in_overlap,
-            'thresholds': {
-                'padj': padj_thresh,
-                'lfc': lfc_thresh,
-                'gjsd_tf': gjsd_thresh_tf,
-                'gjsd_gene': gjsd_thresh_gene
-            }
-        }
-    
-    ### Differential ATAC-seq analysis methods can be added here
-# ============================================================================
-# DIFFERENTIAL ATAC-SEQ FROM SIGNAL VALUES
-# ============================================================================
+
+    # ============================================================================
+    # DIFFERENTIAL ATAC-SEQ ANALYSIS
+    # ============================================================================
+
     def _create_consensus_peaks(
         self,
         merge_distance: int = 100
@@ -1252,7 +1111,6 @@ class NSCAnalysis:
         Build signal matrix: consensus_peaks × samples.
         """
 
-        
         samples = self.atac_annotated['sample'].unique()
         print(f"      Building signal matrix for {len(samples)} samples...")
         
