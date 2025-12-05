@@ -267,6 +267,10 @@ class RegulatoryPathFinder:
         """
         Find all regulatory paths upstream of target_gene using DFS.
         
+        Args:
+            target_gene: Terminal gene to trace from
+            max_depth: Maximum path length (including target)
+            
         Returns:
             List of paths, each path is [master_TF, ..., intermediate_TF, target_gene]
         """
@@ -277,17 +281,21 @@ class RegulatoryPathFinder:
         
         def dfs(current: str, path: List[str], depth: int):
             """Recursive DFS to find all upstream paths."""
+            # Get upstream regulators
             upstream_tfs = self.reverse_graph.get(current, [])
             
+            # If no upstream regulators OR max depth reached → save path
             if not upstream_tfs or depth >= max_depth:
-                if len(path) > 1:
-                    all_paths.append(path)  # <-- FIXED: Don't reverse!
+                if len(path) > 1:  # Path must have at least TF → target
+                    all_paths.append(path[::-1])  # Reverse: master → target
                 return
             
+            # Continue upstream for each regulator
             for tf in upstream_tfs:
-                if tf not in path:
+                if tf not in path:  # Avoid cycles
                     dfs(tf, [tf] + path, depth + 1)
         
+        # Start DFS from target gene
         dfs(target_gene, [target_gene], 1)
         
         return all_paths
@@ -661,6 +669,10 @@ class RegulatoryPathFinder:
         """
         Get JASPAR motif for a TF.
         
+        JASPAR uses uppercase TF names and taxonomy IDs for species.
+        Human (9606) is used as default since TF motifs are highly conserved
+        across vertebrates and JASPAR has more human motifs available.
+        
         Args:
             tf: TF gene symbol
             
@@ -673,16 +685,40 @@ class RegulatoryPathFinder:
         if not self._init_jaspar():
             return None
         
+        # JASPAR uses UPPERCASE TF names
+        tf_upper = tf.upper()
+        
+        # Determine species ID (must be integer taxonomy ID, not string)
+        # Default to human (9606) since motifs are conserved and better annotated
+        if isinstance(self.jaspar_species, int):
+            species_id = self.jaspar_species
+        elif self.jaspar_species == 'Mus musculus':
+            species_id = 10090
+        elif self.jaspar_species == 'Homo sapiens':
+            species_id = 9606
+        else:
+            species_id = 9606  # Default to human
+        
         try:
-            # Search by name
+            # Search by uppercase name with species ID
             results = self.jaspar_db.fetch_motifs(
                 collection='CORE',
-                species=self.jaspar_species,
-                tf_name=tf
+                species=species_id,
+                tf_name=tf_upper
             )
             
             if results:
-                # Take highest version / most recent
+                motif = results[0]
+                self.motif_cache[tf] = motif
+                return motif
+            
+            # Fallback: try without species filter (gets any vertebrate)
+            results = self.jaspar_db.fetch_motifs(
+                collection='CORE',
+                tf_name=tf_upper
+            )
+            
+            if results:
                 motif = results[0]
                 self.motif_cache[tf] = motif
                 return motif
