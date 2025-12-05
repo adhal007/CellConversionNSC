@@ -190,8 +190,8 @@ class RegulatoryPathFinder:
         terminals = sig[sig['is_terminal']].copy()
         
         # Split by direction
-        # Negative log2FC = higher in group1 (reference)
-        # Positive log2FC = higher in group2
+        # Positive log2FC = higher in group1 (reference)
+        # Negative log2FC = higher in group2
         g1_terminals = terminals[terminals['log2FoldChange'] > 0].sort_values('log2FoldChange')
         g2_terminals = terminals[terminals['log2FoldChange'] < 0].sort_values('log2FoldChange', ascending=False)
         
@@ -287,7 +287,7 @@ class RegulatoryPathFinder:
             # If no upstream regulators OR max depth reached → save path
             if not upstream_tfs or depth >= max_depth:
                 if len(path) > 1:  # Path must have at least TF → target
-                    all_paths.append(path[::-1])  # Reverse: master → target
+                    all_paths.append(path)    # Reverse: master → target
                 return
             
             # Continue upstream for each regulator
@@ -612,7 +612,7 @@ class RegulatoryPathFinder:
         self,
         gene: str,
         upstream: int = 2000,
-        downstream: int = 500
+        downstream: int = 1000
     ) -> Optional[str]:
         """
         Extract promoter sequence for a gene.
