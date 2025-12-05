@@ -658,7 +658,176 @@ class NSCAnalysis:
         return results
 
 
+    def get_candidates_with_binding(
+        self, 
+        gjsd_results: Dict[str, pd.DataFrame],
+        overlap_df: pd.DataFrame,
+        ensembl_to_symbol: Dict[str, str],
+        padj_thresh: float = 0.05,
+        lfc_thresh: float = 1.0,
+        gjsd_percentile: float = 95,
+        group1: str = 'E14',
+        group2: str = 'E18'
+    ) -> Dict[str, pd.DataFrame]:
+        """
+        Step 2: Get candidate TFs and genes, then filter by binding evidence.
+        """
+        print(f"\n{'='*60}")
+        print("Step 2: Filter candidates by binding evidence")
+        print(f"{'='*60}")
+        
+        all_results = gjsd_results['all'].copy()
+        
+        # Add symbol if not present
+        if 'symbol' not in all_results.columns:
+            all_results['symbol'] = [ensembl_to_symbol.get(g, g) for g in all_results.index]
+        
+        # Calculate gJSD thresholds - handle empty cases
+        tf_scores = all_results[all_results['is_TF']]['gjsd_score'].dropna()
+        gene_scores = all_results[~all_results['is_TF']]['gjsd_score'].dropna()
+        
+        gjsd_thresh_tf = np.percentile(tf_scores, gjsd_percentile) if len(tf_scores) > 0 else 0
+        gjsd_thresh_gene = np.percentile(gene_scores, gjsd_percentile) if len(gene_scores) > 0 else 0
+        
+        print(f"\nThresholds:")
+        print(f"  padj < {padj_thresh}")
+        print(f"  |log2FC| > {lfc_thresh}")
+        print(f"  gJSD (TF) > {gjsd_thresh_tf:.4f} (p{gjsd_percentile}) [{len(tf_scores)} TFs]")
+        print(f"  gJSD (Gene) > {gjsd_thresh_gene:.4f} (p{gjsd_percentile}) [{len(gene_scores)} genes]")
+        
+        # =========================================================================
+        # STEP 2a: Get candidate TFs and genes by expression
+        # =========================================================================
+        
+        # Positive log2FC = group1-high (E14)
+        # Negative log2FC = group2-high (E18)
+        
+        # TFs
+        g1_tfs = all_results[
+            (all_results['padj'] < padj_thresh) & 
+            (all_results['log2FoldChange'] > lfc_thresh) & 
+            (all_results['is_TF'] == True) &
+            (all_results['gjsd_score'] >= gjsd_thresh_tf)
+        ].copy()
+        
+        g2_tfs = all_results[
+            (all_results['padj'] < padj_thresh) & 
+            (all_results['log2FoldChange'] < -lfc_thresh) & 
+            (all_results['is_TF'] == True) &
+            (all_results['gjsd_score'] >= gjsd_thresh_tf)
+        ].copy()
+        
+        # Genes (handle empty case)
+        if len(gene_scores) > 0:
+            g1_genes = all_results[
+                (all_results['padj'] < padj_thresh) & 
+                (all_results['log2FoldChange'] > lfc_thresh) & 
+                (all_results['is_TF'] == False) &
+                (all_results['gjsd_score'] >= gjsd_thresh_gene)
+            ].copy()
+            
+            g2_genes = all_results[
+                (all_results['padj'] < padj_thresh) & 
+                (all_results['log2FoldChange'] < -lfc_thresh) & 
+                (all_results['is_TF'] == False) &
+                (all_results['gjsd_score'] >= gjsd_thresh_gene)
+            ].copy()
+        else:
+            g1_genes = pd.DataFrame()
+            g2_genes = pd.DataFrame()
+            print("\nWarning: No non-TF genes in gJSD results. Run with gene_type='both'")
+        
+        print(f"\n=== Candidates by expression + gJSD ===")
+        print(f"{group1}-high TFs: {len(g1_tfs)}")
+        print(f"{group2}-high TFs: {len(g2_tfs)}")
+        print(f"{group1}-high genes: {len(g1_genes)}")
+        print(f"{group2}-high genes: {len(g2_genes)}")
+        
+        # =========================================================================
+        # STEP 2b: Get unique TFs and genes from overlap_df
+        # =========================================================================
+        
+        tfs_in_overlap = set(overlap_df['TF'].unique())
+        genes_in_overlap = set(overlap_df['gene'].unique())
+        
+        g1_binding_tfs = set(overlap_df[overlap_df['condition'] == group1]['TF'].unique())
+        g2_binding_tfs = set(overlap_df[overlap_df['condition'] == group2]['TF'].unique())
+        
+        g1_binding_genes = set(overlap_df[overlap_df['condition'] == group1]['gene'].unique())
+        g2_binding_genes = set(overlap_df[overlap_df['condition'] == group2]['gene'].unique())
+        
+        print(f"\n=== Binding evidence in overlap_df ===")
+        print(f"Total TFs with ChIP evidence: {len(tfs_in_overlap)}")
+        print(f"Total target genes with ATAC evidence: {len(genes_in_overlap)}")
+        print(f"TFs with {group1} binding: {len(g1_binding_tfs)}")
+        print(f"TFs with {group2} binding: {len(g2_binding_tfs)}")
+        
+        # =========================================================================
+        # STEP 2c: Filter candidates by binding evidence
+        # =========================================================================
+        
+        g1_tfs_with_binding = g1_tfs[g1_tfs['symbol'].isin(tfs_in_overlap)].copy() if len(g1_tfs) > 0 else pd.DataFrame()
+        g2_tfs_with_binding = g2_tfs[g2_tfs['symbol'].isin(tfs_in_overlap)].copy() if len(g2_tfs) > 0 else pd.DataFrame()
+        
+        g1_tfs_with_g1_binding = g1_tfs[g1_tfs['symbol'].isin(g1_binding_tfs)].copy() if len(g1_tfs) > 0 else pd.DataFrame()
+        g2_tfs_with_g2_binding = g2_tfs[g2_tfs['symbol'].isin(g2_binding_tfs)].copy() if len(g2_tfs) > 0 else pd.DataFrame()
+        
+        g1_genes_with_binding = g1_genes[g1_genes['symbol'].isin(genes_in_overlap)].copy() if len(g1_genes) > 0 else pd.DataFrame()
+        g2_genes_with_binding = g2_genes[g2_genes['symbol'].isin(genes_in_overlap)].copy() if len(g2_genes) > 0 else pd.DataFrame()
+        
+        g1_genes_with_g1_access = g1_genes[g1_genes['symbol'].isin(g1_binding_genes)].copy() if len(g1_genes) > 0 else pd.DataFrame()
+        g2_genes_with_g2_access = g2_genes[g2_genes['symbol'].isin(g2_binding_genes)].copy() if len(g2_genes) > 0 else pd.DataFrame()
+        
+        print(f"\n=== Candidates with binding evidence ===")
+        print(f"{group1}-high TFs with ChIP evidence: {len(g1_tfs_with_binding)}")
+        print(f"{group1}-high TFs with {group1} binding: {len(g1_tfs_with_g1_binding)}")
+        print(f"{group2}-high TFs with ChIP evidence: {len(g2_tfs_with_binding)}")
+        print(f"{group2}-high TFs with {group2} binding: {len(g2_tfs_with_g2_binding)}")
+        print(f"{group1}-high genes with ATAC evidence: {len(g1_genes_with_binding)}")
+        print(f"{group2}-high genes with ATAC evidence: {len(g2_genes_with_binding)}")
+        
+        # =========================================================================
+        # STEP 2d: Show top candidates
+        # =========================================================================
+        
+        print(f"\n=== Top {group1}-high TFs (to UPREGULATE for neurogenesis) ===")
+        if len(g1_tfs_with_binding) > 0:
+            top_g1 = g1_tfs_with_binding.nlargest(10, 'gjsd_score')
+            print(top_g1[['symbol', 'log2FoldChange', 'padj', 'gjsd_score']].to_string())
+        else:
+            print("None found")
+        
+        print(f"\n=== Top {group2}-high TFs (to DOWNREGULATE for neurogenesis) ===")
+        if len(g2_tfs_with_binding) > 0:
+            top_g2 = g2_tfs_with_binding.nlargest(10, 'gjsd_score')
+            print(top_g2[['symbol', 'log2FoldChange', 'padj', 'gjsd_score']].to_string())
+        else:
+            print("None found")
+        
+        return {
+            f'{group1}_TFs': g1_tfs,
+            f'{group2}_TFs': g2_tfs,
+            f'{group1}_genes': g1_genes,
+            f'{group2}_genes': g2_genes,
+            f'{group1}_TFs_with_binding': g1_tfs_with_binding,
+            f'{group2}_TFs_with_binding': g2_tfs_with_binding,
+            f'{group1}_genes_with_binding': g1_genes_with_binding,
+            f'{group2}_genes_with_binding': g2_genes_with_binding,
+            f'{group1}_TFs_with_{group1}_binding': g1_tfs_with_g1_binding,
+            f'{group2}_TFs_with_{group2}_binding': g2_tfs_with_g2_binding,
+            f'{group1}_genes_with_{group1}_access': g1_genes_with_g1_access,
+            f'{group2}_genes_with_{group2}_access': g2_genes_with_g2_access,
+            'tfs_in_overlap': tfs_in_overlap,
+            'genes_in_overlap': genes_in_overlap,
+            'thresholds': {
+                'padj': padj_thresh,
+                'lfc': lfc_thresh,
+                'gjsd_tf': gjsd_thresh_tf,
+                'gjsd_gene': gjsd_thresh_gene
+            }
+        }
     
+
     def get_deseq_markers(
             self, 
             gene_type: str = 'both'
