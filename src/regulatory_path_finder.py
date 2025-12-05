@@ -192,8 +192,8 @@ class RegulatoryPathFinder:
         # Split by direction
         # Negative log2FC = higher in group1 (reference)
         # Positive log2FC = higher in group2
-        g1_terminals = terminals[terminals['log2FoldChange'] < 0].sort_values('log2FoldChange')
-        g2_terminals = terminals[terminals['log2FoldChange'] > 0].sort_values('log2FoldChange', ascending=False)
+        g1_terminals = terminals[terminals['log2FoldChange'] > 0].sort_values('log2FoldChange')
+        g2_terminals = terminals[terminals['log2FoldChange'] < 0].sort_values('log2FoldChange', ascending=False)
         
         print(f"\n{group1}-high terminal genes: {len(g1_terminals)}")
         if len(g1_terminals) > 0:
