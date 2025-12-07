@@ -3,6 +3,11 @@ import pandas as pd
 import numpy as np
 from pathlib import Path
 from typing import Optional, Tuple, List, Dict, Set
+import matplotlib.colors as mcolors
+from matplotlib.colors import LinearSegmentedColormap
+import matplotlib.pyplot as plt
+import seaborn as sns
+from matplotlib.patches import Patch
 
 def plot_candidate_tf_heatmap(
     e14_tfs: pd.DataFrame,
@@ -19,22 +24,11 @@ def plot_candidate_tf_heatmap(
 ):
     """
     Plot heatmap of candidate TFs expression across conditions.
-    
-    Args:
-        e14_tfs: DataFrame of E14-high TFs (to upregulate)
-        e18_tfs: DataFrame of E18-high TFs (to downregulate)
-        vst_counts: VST-normalized counts (genes x samples)
-        metadata: Sample metadata
-        ensembl_to_symbol: Mapping dict
-        group1, group2: Group names
-        group_col: Column in metadata for grouping
-        title: Plot title
-        figsize: Figure size
-        save_path: Path to save figure
+    Uses robust Z-score (median/MAD) instead of mean/std.
     """
     import matplotlib.pyplot as plt
     import seaborn as sns
-    from matplotlib.patches import Patch
+    from scipy.stats import median_abs_deviation
     
     # Get samples
     g1_samples = [s for s in metadata[metadata[group_col] == group1].index 
@@ -60,8 +54,15 @@ def plot_candidate_tf_heatmap(
     # Get expression matrix
     expr = vst_counts.loc[all_tf_ids, g1_samples + g2_samples]
     
-    # Z-score normalize
-    expr_z = expr.subtract(expr.mean(axis=1), axis=0).div(expr.std(axis=1), axis=0)
+    # Robust Z-score: (x - median) / MAD
+    # scale='normal' applies 1.4826 factor so MAD estimates std for normal distribution
+    row_medians = expr.median(axis=1)
+    row_mads = expr.apply(lambda x: median_abs_deviation(x, scale='normal'), axis=1)
+    
+    # Avoid division by zero
+    row_mads = row_mads.replace(0, 1e-10)
+    
+    expr_z = expr.subtract(row_medians, axis=0).div(row_mads, axis=0)
     
     # Get gene symbols for y-axis labels
     gene_labels = [ensembl_to_symbol.get(g, g) for g in all_tf_ids]
@@ -79,7 +80,7 @@ def plot_candidate_tf_heatmap(
         xticklabels=False,
         yticklabels=gene_labels,
         ax=ax,
-        cbar_kws={'label': 'Z-score', 'shrink': 0.8},
+        cbar_kws={'label': 'Robust Z-score', 'shrink': 0.8},
         linewidths=0.5,
         linecolor='white'
     )
@@ -99,16 +100,6 @@ def plot_candidate_tf_heatmap(
             fontsize=12, fontweight='bold', color='#C0392B')
     ax.text(len(g1_samples) + len(g2_samples) / 2, -0.5, group2, ha='center', va='bottom',
             fontsize=12, fontweight='bold', color='#2980B9')
-    
-    # # Add TF group labels on right side
-    # if n_g1 > 0:
-    #     ax.text(len(g1_samples) + len(g2_samples) + 0.5, n_g1 / 2, 
-    #             f'↑ {group1}\n(upregulate)', ha='left', va='center',
-    #             fontsize=10, color='#C0392B', fontweight='bold')
-    # if len(g2_tf_ids) > 0:
-    #     ax.text(len(g1_samples) + len(g2_samples) + 0.5, n_g1 + len(g2_tf_ids) / 2,
-    #             f'↓ {group2}\n(downregulate)', ha='left', va='center',
-    #             fontsize=10, color='#2980B9', fontweight='bold')
     
     ax.set_title(title, fontsize=14, fontweight='bold', pad=20)
     ax.set_xlabel('')
