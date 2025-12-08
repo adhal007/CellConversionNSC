@@ -582,7 +582,22 @@ class NSCAnalysis:
             n_cpus=1
             
         )
-        
+    
+
+        # # VST-normalized counts (recommended for heatmaps/visualization)
+        # dds.vst_fit()
+        # dds.vst_transform()
+        # # See what's available
+        # print(dds.layers.keys()) 
+        # self.vst_counts = dds.layers['vst']  # Returns DataFrame (genes x samples)
+
+        # # Or as a DataFrame explicitly
+        # self.vst_df = pd.DataFrame(
+        #     dds.layers['vst'],
+        #     index=dds.var_names,
+        #     columns=dds.obs_names
+        # )
+
         # Run DESeq2
         print("Running DESeq2...")
         dds.deseq2()
@@ -591,10 +606,10 @@ class NSCAnalysis:
         print(f"Extracting results ({group1} vs {group2})...")
         stat_res = DeseqStats(dds, contrast=[group_col, group1, group2], n_cpus=1)
         stat_res.summary()
-        
 
         # In run_deseq, replace the symbol/is_TF assignment section with:
 
+        self.normed_counts = dds.layers['normed_counts']
         # Get results as DataFrame
         results = stat_res.results_df.copy()
         results['gene_id'] = results.index
@@ -702,7 +717,6 @@ class NSCAnalysis:
         # Positive log2FC = group1-high (E14)
         # Negative log2FC = group2-high (E18)
         
-        # TFs
         g1_tfs = all_results[
             (all_results['padj'] < padj_thresh) & 
             (all_results['log2FoldChange'] > lfc_thresh) & 
@@ -1249,13 +1263,12 @@ class NSCAnalysis:
 
     def _create_consensus_peaks(
         self,
-        merge_distance: int = 100
+        merge_distance: int = 10
     ) -> pd.DataFrame:
         """
         Create consensus peak set by merging overlapping peaks across samples.
+        Also maps genes from atac_annotated to each consensus peak.
         """
-
-        
         peaks = self.atac_annotated[['chr', 'start', 'end']].drop_duplicates()
         print(f"      Unique peaks before merging: {len(peaks)}")
         
@@ -1269,8 +1282,37 @@ class NSCAnalysis:
         
         print(f"      Consensus peaks after merging: {len(consensus)}")
         
+        # Map genes from atac_annotated to consensus peaks
+        print(f"      Mapping genes to consensus peaks...")
+        
+        atac_genes = self.atac_annotated[['chr', 'start', 'end', 'gene']].drop_duplicates()
+        
+        consensus_bed = pybedtools.BedTool.from_dataframe(
+            consensus[['chr', 'start', 'end', 'peak_id']]
+        )
+        atac_genes_bed = pybedtools.BedTool.from_dataframe(atac_genes)
+        
+        # Intersect to find overlapping genes
+        intersect = consensus_bed.intersect(atac_genes_bed, wa=True, wb=True)
+        
+        # Build peak_id -> genes mapping
+        peak_genes = {}
+        for interval in intersect:
+            peak_id = interval[3]
+            gene = interval[7]
+            if peak_id not in peak_genes:
+                peak_genes[peak_id] = set()
+            peak_genes[peak_id].add(gene)
+        
+        # Convert sets to lists
+        consensus['genes'] = consensus['peak_id'].map(
+            lambda x: list(peak_genes.get(x, set()))
+        )
+        
+        n_with_genes = (consensus['genes'].apply(len) > 0).sum()
+        print(f"      Peaks with gene mappings: {n_with_genes} / {len(consensus)}")
+        
         return consensus
-
 
     def _build_atac_signal_matrix(
         self,
@@ -1279,7 +1321,6 @@ class NSCAnalysis:
         """
         Build signal matrix: consensus_peaks × samples.
         """
-
         samples = self.atac_annotated['sample'].unique()
         print(f"      Building signal matrix for {len(samples)} samples...")
         
@@ -1317,6 +1358,90 @@ class NSCAnalysis:
         
         return signal_matrix
 
+    def _filter_atac_by_factor(
+        self,
+        factor: str = 'CD133'
+    ) -> None:
+        """
+        Filter atac_annotated and overlap_df to samples with specific Factor.
+        
+        Args:
+            factor: Factor to keep (e.g., 'CD133' for progenitors)
+        """
+        # Get sample IDs with this factor
+        factor_samples = self.merged_metadata[
+            self.merged_metadata['Factor'] == factor
+        ].index.tolist()
+        
+        print(f"      {factor} samples: {factor_samples}")
+        
+        # Filter atac_annotated
+        n_before = len(self.atac_annotated)
+        self.atac_annotated = self.atac_annotated[
+            self.atac_annotated['sample'].isin(factor_samples)
+        ]
+        n_after = len(self.atac_annotated)
+        print(f"      atac_annotated: {n_before} → {n_after} rows")
+        
+        # Filter overlap_df
+        n_before = len(self.overlap_df)
+        self.overlap_df = self.overlap_df[
+            self.overlap_df['sample'].isin(factor_samples)
+        ]
+        n_after = len(self.overlap_df)
+        print(f"      overlap_df: {n_before} → {n_after} rows")
+        
+        # Verify samples
+        print(f"      Unique samples in atac_annotated: {self.atac_annotated['sample'].nunique()}")
+
+    def _filter_peaks_by_presence(
+        self,
+        signal_matrix: pd.DataFrame,
+        group_col: str = 'Stage',
+        min_samples_per_group: int = 3
+    ) -> pd.DataFrame:
+        """
+        Filter peaks to those with signal in >= min_samples in EITHER group.
+        Uses UNION to preserve condition-specific peaks.
+        
+        Args:
+            signal_matrix: Peak signal matrix (peaks x samples)
+            group_col: Column for grouping in merged_metadata
+            min_samples_per_group: Minimum samples with signal per group
+            
+        Returns:
+            Filtered signal matrix
+        """
+        groups = self.merged_metadata[group_col].unique()
+        
+        keep_peaks = set()
+        
+        for group in groups:
+            group_samples = [
+                s for s in self.merged_metadata[self.merged_metadata[group_col] == group].index 
+                if s in signal_matrix.columns
+            ]
+            
+            # Count non-zero samples per peak
+            nonzero_count = (signal_matrix[group_samples] > 0).sum(axis=1)
+            
+            # Peaks with signal in >= min_samples in this group
+            group_peaks = set(signal_matrix.index[nonzero_count >= min_samples_per_group])
+            
+            print(f"      {group}: {len(group_samples)} samples, {len(group_peaks)} peaks with signal in >= {min_samples_per_group}")
+            
+            # UNION - keep peaks from either group
+            keep_peaks = keep_peaks.union(group_peaks)
+        
+        filtered = signal_matrix.loc[list(keep_peaks)]
+        print(f"      Total peaks after filter (union): {len(filtered)}")
+        
+        # Report zeros in filtered matrix
+        zeros_per_peak = (filtered == 0).sum(axis=1)
+        print(f"      Peaks with some missing data: {(zeros_per_peak > 0).sum()}")
+        print(f"      Peaks with complete data: {(zeros_per_peak == 0).sum()}")
+        
+        return filtered
 
     def _run_dar_stats(
         self,
@@ -1324,73 +1449,150 @@ class NSCAnalysis:
         group1: str,
         group2: str,
         group_col: str = 'Stage',
+        min_present: int = 3,
         method: str = 'ttest',
         padj_thresh: float = 0.05,
         lfc_thresh: float = 1.0
     ) -> pd.DataFrame:
         """
-        Run differential accessibility statistics on signal matrix.
+        Run differential accessibility analysis with proper handling of missing data.
+        
+        Tests for both:
+        1. Signal differences (among samples where peak is present)
+        2. Presence differences (Fisher's exact test)
+        
+        Args:
+            signal_matrix: Peak signal matrix (peaks x samples)
+            group1: First group name
+            group2: Second group name  
+            group_col: Column for grouping
+            min_present: Minimum samples with signal for signal test
+            method: Statistical method ('ttest' or 'wilcoxon')
+            padj_thresh: P-value threshold for significance
+            lfc_thresh: Log2FC threshold for significance
+            
+        Returns:
+            DataFrame with DAR statistics
         """
-
-        
-        g1_samples = self.metadata[self.metadata[group_col] == group1].index.tolist()
-        g2_samples = self.metadata[self.metadata[group_col] == group2].index.tolist()
-        
-        g1_samples = [s for s in g1_samples if s in signal_matrix.columns]
-        g2_samples = [s for s in g2_samples if s in signal_matrix.columns]
+        # Get samples per group
+        g1_samples = [
+            s for s in self.merged_metadata[self.merged_metadata[group_col] == group1].index 
+            if s in signal_matrix.columns
+        ]
+        g2_samples = [
+            s for s in self.merged_metadata[self.merged_metadata[group_col] == group2].index 
+            if s in signal_matrix.columns
+        ]
         
         print(f"      Samples: {group1}={len(g1_samples)}, {group2}={len(g2_samples)}")
         
-        log_signal = np.log2(signal_matrix + 1)
-        
         results = []
+        
         for peak_id in signal_matrix.index:
-            g1_vals = log_signal.loc[peak_id, g1_samples].values
-            g2_vals = log_signal.loc[peak_id, g2_samples].values
+            # Raw signal values
+            g1_raw = signal_matrix.loc[peak_id, g1_samples]
+            g2_raw = signal_matrix.loc[peak_id, g2_samples]
             
-            mean_g1 = np.mean(g1_vals)
-            mean_g2 = np.mean(g2_vals)
+            # Count presence (non-zero)
+            g1_present = (g1_raw > 0).sum()
+            g2_present = (g2_raw > 0).sum()
+            g1_absent = len(g1_samples) - g1_present
+            g2_absent = len(g2_samples) - g2_present
+            
+            # Log transform non-zero values only
+            g1_vals = np.log2(g1_raw[g1_raw > 0] + 1)
+            g2_vals = np.log2(g2_raw[g2_raw > 0] + 1)
+            
+            # Calculate mean signal (only from present samples)
+            mean_g1 = g1_vals.mean() if len(g1_vals) > 0 else 0
+            mean_g2 = g2_vals.mean() if len(g2_vals) > 0 else 0
             log2fc = mean_g1 - mean_g2
             
-            if method == 'ttest':
-                stat, pval = stats.ttest_ind(g1_vals, g2_vals)
-            elif method == 'wilcoxon':
-                try:
-                    stat, pval = stats.mannwhitneyu(g1_vals, g2_vals, alternative='two-sided')
-                except:
-                    pval = 1.0
+            # Signal test (only if enough non-zero in both groups)
+            if len(g1_vals) >= min_present and len(g2_vals) >= min_present:
+                if method == 'ttest':
+                    _, pval_signal = stats.ttest_ind(g1_vals, g2_vals)
+                elif method == 'wilcoxon':
+                    try:
+                        _, pval_signal = stats.mannwhitneyu(g1_vals, g2_vals, alternative='two-sided')
+                    except:
+                        pval_signal = 1.0
+                else:
+                    raise ValueError(f"Unknown method: {method}")
             else:
-                raise ValueError(f"Unknown method: {method}")
+                pval_signal = 1.0
+            
+            # Presence test (Fisher's exact)
+            try:
+                _, pval_presence = stats.fisher_exact([
+                    [g1_present, g1_absent],
+                    [g2_present, g2_absent]
+                ])
+            except:
+                pval_presence = 1.0
+            
+            # Combined p-value (minimum of signal and presence tests)
+            pval_combined = min(pval_signal, pval_presence)
+            
+            # Determine test type that drove significance
+            if pval_signal < pval_presence:
+                sig_test = 'signal'
+            elif pval_presence < pval_signal:
+                sig_test = 'presence'
+            else:
+                sig_test = 'both'
             
             results.append({
                 'peak_id': peak_id,
+                'g1_present': g1_present,
+                'g2_present': g2_present,
+                'g1_n': len(g1_samples),
+                'g2_n': len(g2_samples),
                 'mean_log2_g1': mean_g1,
                 'mean_log2_g2': mean_g2,
                 'log2FoldChange': log2fc,
-                'pvalue': pval
+                'pval_signal': pval_signal,
+                'pval_presence': pval_presence,
+                'pvalue': pval_combined,
+                'sig_test': sig_test
             })
         
         results_df = pd.DataFrame(results).set_index('peak_id')
+        
+        # FDR correction
         results_df['padj'] = multipletests(results_df['pvalue'], method='fdr_bh')[1]
         
+        # Significance
         results_df['significant'] = (
             (results_df['padj'] < padj_thresh) & 
             (results_df['log2FoldChange'].abs() > lfc_thresh)
         )
+        
+        # Direction
         results_df['direction'] = np.where(
             results_df['log2FoldChange'] > 0, group1, group2
         )
         
+        # Summary statistics
         n_sig = results_df['significant'].sum()
-        n_g1 = ((results_df['significant']) & (results_df['log2FoldChange'] > 0)).sum()
-        n_g2 = ((results_df['significant']) & (results_df['log2FoldChange'] < 0)).sum()
+        n_g1 = ((results_df['significant']) & (results_df['direction'] == group1)).sum()
+        n_g2 = ((results_df['significant']) & (results_df['direction'] == group2)).sum()
         
-        print(f"\n      Significant DARs: {n_sig} (padj<{padj_thresh}, |log2FC|>{lfc_thresh})")
+        print(f"\n      === DAR Results ===")
+        print(f"      Total peaks tested: {len(results_df)}")
+        print(f"      Significant DARs: {n_sig} (padj<{padj_thresh}, |log2FC|>{lfc_thresh})")
         print(f"        {group1}-specific (more open): {n_g1}")
         print(f"        {group2}-specific (more open): {n_g2}")
         
+        # Break down by test type
+        if n_sig > 0:
+            sig_dars = results_df[results_df['significant']]
+            print(f"\n      Significance driven by:")
+            print(f"        Signal differences: {(sig_dars['sig_test'] == 'signal').sum()}")
+            print(f"        Presence differences: {(sig_dars['sig_test'] == 'presence').sum()}")
+            print(f"        Both: {(sig_dars['sig_test'] == 'both').sum()}")
+        
         return results_df
-
 
     def _create_differential_overlap(
         self,
@@ -1402,74 +1604,90 @@ class NSCAnalysis:
         lfc_thresh: float = 1.0
     ) -> pd.DataFrame:
         """
-        Create overlap_df using only DIFFERENTIALLY accessible regions.
+        Create overlap_df subset with only differentially accessible TF-gene bindings.
         """
-
+        # Get significant DARs with coordinates
+        sig_dars = dar_results[dar_results['significant']].reset_index()
+        sig_dars = sig_dars.merge(consensus_peaks, on='peak_id', how='left')
         
-        g1_dars = dar_results[
-            (dar_results['padj'] < padj_thresh) & 
-            (dar_results['log2FoldChange'] > lfc_thresh)
-        ].index.tolist()
-        
-        g2_dars = dar_results[
-            (dar_results['padj'] < padj_thresh) & 
-            (dar_results['log2FoldChange'] < -lfc_thresh)
-        ].index.tolist()
+        g1_dars = sig_dars[sig_dars['log2FoldChange'] > lfc_thresh]
+        g2_dars = sig_dars[sig_dars['log2FoldChange'] < -lfc_thresh]
         
         print(f"      {group1}-specific DARs: {len(g1_dars)}")
         print(f"      {group2}-specific DARs: {len(g2_dars)}")
         
-        g1_dar_coords = consensus_peaks[consensus_peaks['peak_id'].isin(g1_dars)]
-        g2_dar_coords = consensus_peaks[consensus_peaks['peak_id'].isin(g2_dars)]
+        # Get unique ATAC coordinates from overlap_df
+        overlap_regions = self.overlap_df[['atac_chr', 'atac_start', 'atac_end']].drop_duplicates()
+        overlap_regions.columns = ['chr', 'start', 'end']
         
-        chip_peaks = self.chip_annotated[['seqnames', 'start', 'end', 'TF', 'gene', 'chip_score']].drop_duplicates()
-        chip_peaks.columns = ['chr', 'start', 'end', 'TF', 'gene', 'chip_score']
-        chip_bed = pybedtools.BedTool.from_dataframe(chip_peaks)
+        if len(overlap_regions) == 0:
+            print("      No overlap regions available")
+            return pd.DataFrame()
         
-        def overlap_and_parse(dar_coords, condition):
+        overlap_bed = pybedtools.BedTool.from_dataframe(overlap_regions)
+        
+        def get_dar_overlapping_coords(dar_coords, condition):
             if len(dar_coords) == 0:
-                return pd.DataFrame()
+                return set()
             
-            dar_bed = pybedtools.BedTool.from_dataframe(dar_coords[['chr', 'start', 'end', 'peak_id']])
-            overlap = chip_bed.intersect(dar_bed, wa=True, wb=True)
+            dar_bed = pybedtools.BedTool.from_dataframe(
+                dar_coords[['chr', 'start', 'end']]
+            )
             
-            records = []
-            for interval in overlap:
-                records.append({
-                    'chr': interval[0],
-                    'start': int(interval[1]),
-                    'end': int(interval[2]),
-                    'TF': interval[3],
-                    'gene': interval[4],
-                    'chip_score': float(interval[5]),
-                    'dar_peak_id': interval[9],
-                    'condition': condition
-                })
+            intersect = overlap_bed.intersect(dar_bed, wa=True, u=True)
             
-            return pd.DataFrame(records)
+            overlapping = set()
+            for interval in intersect:
+                overlapping.add((interval[0], int(interval[1]), int(interval[2])))
+            
+            return overlapping
         
-        g1_overlap = overlap_and_parse(g1_dar_coords, group1)
-        g2_overlap = overlap_and_parse(g2_dar_coords, group2)
+        g1_overlapping = get_dar_overlapping_coords(g1_dars, group1)
+        g2_overlapping = get_dar_overlapping_coords(g2_dars, group2)
+        
+        print(f"\n      Overlap_df regions in {group1} DARs: {len(g1_overlapping)}")
+        print(f"      Overlap_df regions in {group2} DARs: {len(g2_overlapping)}")
+        
+        # Subset overlap_df
+        self.overlap_df['atac_coords'] = list(zip(
+            self.overlap_df['atac_chr'],
+            self.overlap_df['atac_start'],
+            self.overlap_df['atac_end']
+        ))
+        
+        g1_overlap = self.overlap_df[self.overlap_df['atac_coords'].isin(g1_overlapping)].copy()
+        g2_overlap = self.overlap_df[self.overlap_df['atac_coords'].isin(g2_overlapping)].copy()
+        
+        g1_overlap['dar_condition'] = group1
+        g2_overlap['dar_condition'] = group2
         
         diff_overlap = pd.concat([g1_overlap, g2_overlap], ignore_index=True)
         
-        print(f"\n      ChIP peaks in {group1}-specific DARs: {len(g1_overlap)}")
-        print(f"      ChIP peaks in {group2}-specific DARs: {len(g2_overlap)}")
-        print(f"      Total differential TF-gene bindings: {len(diff_overlap)}")
+        # Clean up temp column
+        if 'atac_coords' in self.overlap_df.columns:
+            self.overlap_df = self.overlap_df.drop(columns=['atac_coords'])
+        if 'atac_coords' in diff_overlap.columns:
+            diff_overlap = diff_overlap.drop(columns=['atac_coords'])
+        
+        print(f"\n      === Differential Overlap ===")
+        print(f"      Total rows: {len(diff_overlap)}")
+        print(f"      {group1}-specific TF-gene bindings: {len(g1_overlap)}")
+        print(f"      {group2}-specific TF-gene bindings: {len(g2_overlap)}")
         if len(diff_overlap) > 0:
             print(f"      Unique TFs: {diff_overlap['TF'].nunique()}")
             print(f"      Unique genes: {diff_overlap['gene'].nunique()}")
         
         return diff_overlap
 
-
     def run_differential_atac(
         self,
         group1: str = 'E14',
         group2: str = 'E18',
         group_col: str = 'Stage',
+        factor_filter: Optional[str] = 'CD133',
         method: str = 'ttest',
         merge_distance: int = 100,
+        min_samples_per_group: int = 3,
         padj_thresh: float = 0.05,
         lfc_thresh: float = 1.0
     ) -> Dict[str, pd.DataFrame]:
@@ -1479,8 +1697,10 @@ class NSCAnalysis:
         Args:
             group1, group2: Groups to compare
             group_col: Metadata column for grouping
+            factor_filter: If set, filter to this Factor (e.g., 'CD133')
             method: 'ttest' or 'wilcoxon'
             merge_distance: Distance to merge nearby peaks
+            min_samples_per_group: Min samples with signal per group
             padj_thresh: Adjusted p-value threshold
             lfc_thresh: Log2 fold change threshold
             
@@ -1491,28 +1711,42 @@ class NSCAnalysis:
         print(f"Differential ATAC: {group1} vs {group2}")
         print(f"{'='*60}")
         
+        # 0. Filter samples if needed
+        if factor_filter:
+            print(f"\n[0/5] Filtering to {factor_filter} samples...")
+            self._filter_atac_by_factor(factor_filter)
+        
         # 1. Create consensus peaks
-        print("\n[1/4] Creating consensus peaks...")
+        print("\n[1/5] Creating consensus peaks...")
         self.consensus_peaks = self._create_consensus_peaks(merge_distance=merge_distance)
         
         # 2. Build signal matrix
-        print("\n[2/4] Building signal matrix...")
+        print("\n[2/5] Building signal matrix...")
         self.atac_signal_matrix = self._build_atac_signal_matrix(self.consensus_peaks)
         
-        # 3. Run differential analysis
-        print("\n[3/4] Running differential analysis...")
-        self.dar_results = self._run_dar_stats(
+        # 3. Filter peaks by presence
+        print(f"\n[3/5] Filtering peaks by presence (min {min_samples_per_group} per group)...")
+        self.atac_signal_matrix_filtered = self._filter_peaks_by_presence(
             self.atac_signal_matrix,
+            group_col=group_col,
+            min_samples_per_group=min_samples_per_group
+        )
+        
+        # 4. Run differential analysis
+        print("\n[4/5] Running differential analysis...")
+        self.dar_results = self._run_dar_stats(
+            self.atac_signal_matrix_filtered,
             group1=group1,
             group2=group2,
             group_col=group_col,
+            min_present=min_samples_per_group,
             method=method,
             padj_thresh=padj_thresh,
             lfc_thresh=lfc_thresh
         )
         
-        # 4. Create differential overlap with ChIP
-        print("\n[4/4] Creating differential overlap with ChIP...")
+        # 5. Create differential overlap with ChIP
+        print("\n[5/5] Creating differential overlap...")
         self.diff_overlap_df = self._create_differential_overlap(
             self.dar_results,
             self.consensus_peaks,
@@ -1520,6 +1754,29 @@ class NSCAnalysis:
             group2=group2,
             padj_thresh=padj_thresh,
             lfc_thresh=lfc_thresh
+        )
+        
+        # Store parameters
+        self.dar_params = {
+            'group1': group1,
+            'group2': group2,
+            'group_col': group_col,
+            'factor_filter': factor_filter,
+            'min_samples_per_group': min_samples_per_group,
+            'method': method,
+            'padj_thresh': padj_thresh,
+            'lfc_thresh': lfc_thresh
+        }
+        
+        print(f"\n{'='*60}")
+        print("Differential ATAC complete!")
+        print(f"{'='*60}")
+        # After step 5, merge genes into dar_results
+        self.dar_results = self.dar_results.merge(
+            self.consensus_peaks[['peak_id', 'genes']].set_index('peak_id'),
+            left_index=True,
+            right_index=True,
+            how='left'
         )
         
         print(f"\n{'='*60}")
@@ -1530,5 +1787,6 @@ class NSCAnalysis:
             'dar_results': self.dar_results,
             'diff_overlap': self.diff_overlap_df,
             'consensus_peaks': self.consensus_peaks,
-            'signal_matrix': self.atac_signal_matrix
+            'signal_matrix': self.atac_signal_matrix,
+            'signal_matrix_filtered': self.atac_signal_matrix_filtered
         }
