@@ -1257,3 +1257,184 @@ class RegulatoryPathFinder:
         print("="*70)
         
         return results
+
+    def discover_motif_based_edges(
+        self,
+        tf_symbols: List[str] = None,
+        condition: str = None,
+        promoter_upstream: int = 2000,
+        promoter_downstream: int = 500,
+        motif_threshold: float = 0.80,
+        min_atac_signal: float = 0
+    ) -> pd.DataFrame:
+        """
+        Discover regulatory edges based on motif presence in accessible promoters.
+        
+        For TFs without ChIP binding data, infer edges by:
+        1. Finding genes with ATAC-accessible promoters
+        2. Scanning for TF motif in accessible regions
+        
+        Args:
+            tf_symbols: List of TF symbols to analyze (default: DEG TFs without ChIP)
+            condition: Filter ATAC peaks by condition ('E14', 'E18', or None for both)
+            promoter_upstream: bp upstream of TSS
+            promoter_downstream: bp downstream of TSS
+            motif_threshold: PWM score threshold (0-1)
+            min_atac_signal: Minimum ATAC signal to consider accessible
+            
+        Returns:
+            DataFrame with columns: TF, gene, motif_score, n_motif_hits, atac_signal, condition
+        """
+        # Load required data
+        if not self._load_genome():
+            raise ValueError("Genome FASTA required for motif scanning")
+        if not self._load_tss_coordinates():
+            raise ValueError("GTF required for TSS coordinates")
+        if not self._init_jaspar():
+            raise ValueError("JASPAR database required")
+        
+        # Determine which TFs to analyze
+        tfs_with_chip = set(self.overlap_df['TF'].unique())
+        
+        if tf_symbols is None:
+            # Default: DEG TFs that lack ChIP data
+            deg_tfs = self.deg_symbols & self.tf_symbols
+            tf_symbols = list(deg_tfs - tfs_with_chip)
+            print(f"Analyzing {len(tf_symbols)} DEG TFs without ChIP data")
+        
+        # Get genes with accessible promoters from ATAC data
+        print("Finding genes with accessible promoters...")
+        accessible_genes = self._get_accessible_promoter_genes(
+            condition=condition,
+            min_signal=min_atac_signal
+        )
+        print(f"  Found {len(accessible_genes)} genes with accessible promoters")
+        
+        # Scan for motifs
+        results = []
+        
+        for tf in tqdm(tf_symbols, desc="Scanning TF motifs"):
+            # Get motif for this TF
+            motif = self.get_tf_motif(tf)
+            if motif is None:
+                continue
+            
+            # Scan each accessible gene's promoter
+            for gene, atac_info in accessible_genes.items():
+                # Get promoter sequence
+                seq = self.get_promoter_sequence(
+                    gene, 
+                    upstream=promoter_upstream,
+                    downstream=promoter_downstream
+                )
+                
+                if seq is None or len(seq) < 50:
+                    continue
+                
+                # Scan for motif
+                hits = self.scan_motif_in_sequence(seq, motif, threshold_pct=motif_threshold)
+                
+                if hits:
+                    best_score = max(h['rel_score'] for h in hits)
+                    results.append({
+                        'TF': tf,
+                        'gene': gene,
+                        'n_motif_hits': len(hits),
+                        'best_motif_score': best_score,
+                        'jaspar_id': motif.matrix_id,
+                        'atac_signal': atac_info['mean_signal'],
+                        'condition': atac_info.get('condition', 'both'),
+                        'edge_type': 'motif_inferred'
+                    })
+        
+        df = pd.DataFrame(results)
+        print(f"\nDiscovered {len(df)} motif-based edges for {df['TF'].nunique()} TFs")
+        
+        return df
+
+
+    def _get_accessible_promoter_genes(
+        self,
+        condition: str = None,
+        min_signal: float = 0,
+        tss_window: int = 2000
+    ) -> Dict[str, Dict]:
+        """
+        Get genes with ATAC-accessible promoters.
+        
+        Returns:
+            Dict: {gene_symbol: {'mean_signal': float, 'condition': str, ...}}
+        """
+        # Filter ATAC data for promoter peaks
+        atac_promoter = self.atac_annotated[
+            self.atac_annotated['annotation'].str.contains('Promoter', na=False)
+        ].copy()
+        
+        if condition:
+            atac_promoter = atac_promoter[atac_promoter['condition'] == condition]
+        
+        if min_signal > 0 and 'signal' in atac_promoter.columns:
+            atac_promoter = atac_promoter[atac_promoter['signal'] >= min_signal]
+        
+        # Group by gene
+        accessible = {}
+        for gene in atac_promoter['gene'].unique():
+            gene_data = atac_promoter[atac_promoter['gene'] == gene]
+            
+            accessible[gene] = {
+                'mean_signal': gene_data['signal'].mean() if 'signal' in gene_data.columns else 1.0,
+                'n_peaks': len(gene_data),
+                'condition': condition or 'both'
+            }
+        
+        return accessible
+
+    def build_regulatory_graph_with_motifs(
+        self,
+        include_motif_edges: bool = True,
+        motif_threshold: float = 0.80
+    ) -> None:
+        """
+        Build regulatory graph combining ChIP-based and motif-inferred edges.
+        """
+        print(f"\n{'='*60}")
+        print("Building regulatory graph (ChIP + Motif-based)")
+        print(f"{'='*60}")
+        
+        # Start with ChIP-based edges
+        self.build_regulatory_graph()
+        
+        chip_edges = sum(len(v) for v in self.forward_graph.values())
+        print(f"ChIP-based edges: {chip_edges}")
+        
+        if include_motif_edges:
+            # Discover motif-based edges for TFs without ChIP
+            motif_edges_df = self.discover_motif_based_edges(
+                motif_threshold=motif_threshold
+            )
+            
+            if len(motif_edges_df) > 0:
+                # Store motif edges separately for reference
+                self.motif_edges = motif_edges_df
+                
+                # Add to graphs
+                for _, row in motif_edges_df.iterrows():
+                    tf = row['TF']
+                    gene = row['gene']
+                    
+                    # Add to forward graph
+                    if tf not in self.forward_graph:
+                        self.forward_graph[tf] = []
+                    if gene not in self.forward_graph[tf]:
+                        self.forward_graph[tf].append(gene)
+                    
+                    # Add to reverse graph
+                    if gene not in self.reverse_graph:
+                        self.reverse_graph[gene] = []
+                    if tf not in self.reverse_graph[gene]:
+                        self.reverse_graph[gene].append(tf)
+                
+                motif_edge_count = len(motif_edges_df)
+                print(f"Motif-inferred edges: {motif_edge_count}")
+                print(f"Total edges: {chip_edges + motif_edge_count}")
+                print(f"New TFs added: {motif_edges_df['TF'].nunique()}")
