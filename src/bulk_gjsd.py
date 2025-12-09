@@ -508,8 +508,8 @@ class BulkGJSD:
 # =============================================================================
 
 def filter_bidirectional_results(results_df: pd.DataFrame, 
-                                  min_magnitude: float = 0.1,
-                                  min_abs_direction: float = 0.5) -> Dict[str, pd.DataFrame]:
+                                  min_magnitude: float = 0.0,
+                                  min_abs_direction: float = 0.0) -> Dict[str, pd.DataFrame]:
     """
     Filter bidirectional results by magnitude and direction thresholds.
     
