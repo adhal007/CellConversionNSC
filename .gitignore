@@ -7,3 +7,16 @@
 __pycache__/
 *.pyc
 .env
+.vscode/
+*bed* 
+*gtf* 
+*chip*
+*annotated*
+*pkl*
+*fa*
+*bam* 
+*pdf*
+*csv*
+*err* 
+*out* 
+*RData*
