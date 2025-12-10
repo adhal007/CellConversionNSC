@@ -9,6 +9,47 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 from matplotlib.patches import Patch
 
+def get_comparison_tfs(result, top_n=500, padj_thresh=0.05, lfc_thresh=1.0, verbose=True):
+    """
+    Extract top TFs from a comparison result.
+    """
+    if result is None:
+        return pd.DataFrame(), pd.DataFrame()
+    
+    gjsd = result['gjsd']
+    g1, g2 = result['group1'], result['group2']
+    
+    # Group1-specific TFs
+    g1_mask = (
+        (gjsd['all']['is_TF'] == True) &
+        (gjsd['all']['padj'] < padj_thresh) &
+        (gjsd['all']['log2FoldChange'] > lfc_thresh)
+    )
+    g1_tfs = gjsd['group1_specific'][g1_mask].sort_values('gjsd_score', ascending=False)
+    
+    # Group2-specific TFs
+    g2_mask = (
+        (gjsd['all']['is_TF'] == True) &
+        (gjsd['all']['padj'] < padj_thresh) &
+        (gjsd['all']['log2FoldChange'] < -lfc_thresh)
+    )
+    g2_tfs = gjsd['all'][g2_mask].sort_values('gjsd_score', ascending=False)
+    
+    if verbose:
+        print(f"\n  Filters: padj < {padj_thresh}, |log2FC| > {lfc_thresh}")
+        print(f"  {g1}-high TFs: {len(g1_tfs)} total, returning top {min(top_n, len(g1_tfs))}")
+        print(f"  {g2}-high TFs: {len(g2_tfs)} total, returning top {min(top_n, len(g2_tfs))}")
+        
+        if len(g1_tfs) > 0:
+            print(f"\n  Top {g1}-high TFs:")
+            print(g1_tfs[['symbol', 'log2FoldChange', 'padj', 'gjsd_score']].head(5).to_string())
+        
+        if len(g2_tfs) > 0:
+            print(f"\n  Top {g2}-high TFs:")
+            print(g2_tfs[['symbol', 'log2FoldChange', 'padj', 'gjsd_score']].head(5).to_string())
+    
+    return g1_tfs.head(top_n), g2_tfs.head(top_n)
+
 def plot_candidate_tf_heatmap(
     e14_tfs: pd.DataFrame,
     e18_tfs: pd.DataFrame,

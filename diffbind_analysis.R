@@ -1,5 +1,5 @@
 # ==============================================================================
-# DiffBind Analysis for ATAC-seq
+# DiffBind Analysis for ATAC-seq - FIXED
 # ==============================================================================
 
 library(DiffBind)
@@ -8,10 +8,7 @@ library(tidyverse)
 cat("=== Starting DiffBind Analysis ===\n")
 cat("Time:", format(Sys.time()), "\n\n")
 
-# Set working directory
 setwd("/home/users/adhal/CorticalNeuronFate/CellConversionNSC")
-
-# Create results directory
 dir.create("results/diffbind", recursive = TRUE, showWarnings = FALSE)
 
 # ==============================================================================
@@ -20,6 +17,10 @@ dir.create("results/diffbind", recursive = TRUE, showWarnings = FALSE)
 
 cat("Loading sample sheet...\n")
 samples <- read.csv("data/atac_seq/ATAC-seq/samples_clean.csv")
+
+# Fix PSA-NCAM naming (remove hyphen causing issues)
+samples$Factor <- gsub("PSA-NCAM", "PSANCAM", samples$Factor)
+
 print(samples[, c("SampleID", "Tissue", "Factor", "Condition")])
 
 cat("\nSample distribution:\n")
@@ -30,17 +31,11 @@ cat("\nCreating DiffBind object...\n")
 dba_obj <- dba(sampleSheet = samples)
 print(dba_obj)
 
-# Plot correlation based on peak overlap
-pdf("results/diffbind/01_peak_overlap_correlation.pdf", width = 10, height = 10)
-plot(dba_obj)
-dev.off()
-cat("Saved: 01_peak_overlap_correlation.pdf\n")
-
 # ==============================================================================
 # 2. Count reads in consensus peaks
 # ==============================================================================
 
-cat("\n=== Counting reads in peaks (this takes ~30-60 min) ===\n")
+cat("\n=== Counting reads in peaks ===\n")
 cat("Start time:", format(Sys.time()), "\n")
 
 dba_obj <- dba.count(dba_obj, 
@@ -50,27 +45,10 @@ dba_obj <- dba.count(dba_obj,
 
 cat("End time:", format(Sys.time()), "\n")
 
-# Save checkpoint
 save(dba_obj, file = "results/diffbind/dba_counted.RData")
 cat("Saved checkpoint: dba_counted.RData\n")
 
-# Normalize
 dba_obj <- dba.normalize(dba_obj)
-
-# Plot correlation after counting
-pdf("results/diffbind/02_count_correlation.pdf", width = 10, height = 10)
-plot(dba_obj)
-dev.off()
-
-# PCA
-pdf("results/diffbind/03_pca_all_samples.pdf", width = 10, height = 8)
-dba.plotPCA(dba_obj, label = DBA_ID)
-dev.off()
-
-pdf("results/diffbind/03_pca_by_condition.pdf", width = 10, height = 8)
-dba.plotPCA(dba_obj, attributes = c(DBA_CONDITION, DBA_TISSUE), label = DBA_ID)
-dev.off()
-cat("Saved: PCA plots\n")
 
 # ==============================================================================
 # 3. Differential Analysis - TEMPORAL CD133 (E14 vs E18)
@@ -144,44 +122,106 @@ cat("  Cortex-high:", sum(results_regional_sig$Fold > 0), "\n")
 cat("  LGE-high:", sum(results_regional_sig$Fold < 0), "\n")
 
 # ==============================================================================
-# 6. Visualizations
+# 6. CORTEX-ONLY TEMPORAL (E14 vs E18)
+# ==============================================================================
+
+cat("\n=== Running Cortex-only Temporal comparison ===\n")
+
+dba_ctx <- dba(dba_obj, mask = dba_obj$samples$Tissue == "Cortex")
+print(dba_ctx)
+
+dba_ctx <- dba.contrast(dba_ctx,
+                         reorderMeta = list(Condition = "E14"),
+                         design = "~Factor + Condition",
+                         minMembers = 2)
+
+dba_ctx <- dba.analyze(dba_ctx, method = DBA_DESEQ2)
+
+results_ctx_temporal <- dba.report(dba_ctx, th = 1)
+results_ctx_temporal_sig <- dba.report(dba_ctx, th = 0.05, fold = 1)
+
+cat("\nCortex Temporal (E14 vs E18):\n")
+cat("  Total peaks tested:", length(results_ctx_temporal), "\n")
+cat("  Significant (FDR<0.05, |LFC|>1):", length(results_ctx_temporal_sig), "\n")
+cat("  E14-high:", sum(results_ctx_temporal_sig$Fold > 0), "\n")
+cat("  E18-high:", sum(results_ctx_temporal_sig$Fold < 0), "\n")
+
+# ==============================================================================
+# 7. Visualizations (with error handling)
 # ==============================================================================
 
 cat("\n=== Generating plots ===\n")
 
-# MA plots
-pdf("results/diffbind/04_MA_plots.pdf", width = 12, height = 4)
-par(mfrow = c(1, 3))
-dba.plotMA(dba_cd133, contrast = 1, main = "Temporal CD133: E14 vs E18")
-dba.plotMA(dba_all, contrast = 1, main = "Temporal ALL: E14 vs E18")
-dba.plotMA(dba_regional, contrast = 1, main = "Regional E14: Cortex vs LGE")
-dev.off()
+# Correlation heatmaps
+tryCatch({
+    pdf("results/diffbind/01_correlation_heatmap.pdf", width = 10, height = 10)
+    plot(dba_obj)
+    dev.off()
+    cat("Saved: 01_correlation_heatmap.pdf\n")
+}, error = function(e) cat("Correlation plot error:", e$message, "\n"))
+
+# PCA
+tryCatch({
+    pdf("results/diffbind/02_pca.pdf", width = 10, height = 8)
+    dba.plotPCA(dba_obj, label = DBA_ID)
+    dev.off()
+    cat("Saved: 02_pca.pdf\n")
+}, error = function(e) cat("PCA plot error:", e$message, "\n"))
+
+# MA plots - use method without main argument
+tryCatch({
+    pdf("results/diffbind/03_MA_temporal_cd133.pdf", width = 8, height = 6)
+    dba.plotMA(dba_cd133, contrast = 1)
+    dev.off()
+    cat("Saved: 03_MA_temporal_cd133.pdf\n")
+}, error = function(e) cat("MA plot cd133 error:", e$message, "\n"))
+
+tryCatch({
+    pdf("results/diffbind/03_MA_temporal_all.pdf", width = 8, height = 6)
+    dba.plotMA(dba_all, contrast = 1)
+    dev.off()
+    cat("Saved: 03_MA_temporal_all.pdf\n")
+}, error = function(e) cat("MA plot all error:", e$message, "\n"))
+
+tryCatch({
+    pdf("results/diffbind/03_MA_regional.pdf", width = 8, height = 6)
+    dba.plotMA(dba_regional, contrast = 1)
+    dev.off()
+    cat("Saved: 03_MA_regional.pdf\n")
+}, error = function(e) cat("MA plot regional error:", e$message, "\n"))
+
+tryCatch({
+    pdf("results/diffbind/03_MA_ctx_temporal.pdf", width = 8, height = 6)
+    dba.plotMA(dba_ctx, contrast = 1)
+    dev.off()
+    cat("Saved: 03_MA_ctx_temporal.pdf\n")
+}, error = function(e) cat("MA plot ctx error:", e$message, "\n"))
 
 # Volcano plots
-pdf("results/diffbind/05_volcano_plots.pdf", width = 12, height = 4)
-par(mfrow = c(1, 3))
-dba.plotVolcano(dba_cd133, contrast = 1)
-dba.plotVolcano(dba_all, contrast = 1)
-dba.plotVolcano(dba_regional, contrast = 1)
-dev.off()
+tryCatch({
+    pdf("results/diffbind/04_volcano_temporal_cd133.pdf", width = 8, height = 6)
+    dba.plotVolcano(dba_cd133, contrast = 1)
+    dev.off()
+    cat("Saved: 04_volcano_temporal_cd133.pdf\n")
+}, error = function(e) cat("Volcano plot error:", e$message, "\n"))
+
+tryCatch({
+    pdf("results/diffbind/04_volcano_ctx_temporal.pdf", width = 8, height = 6)
+    dba.plotVolcano(dba_ctx, contrast = 1)
+    dev.off()
+    cat("Saved: 04_volcano_ctx_temporal.pdf\n")
+}, error = function(e) cat("Volcano ctx plot error:", e$message, "\n"))
 
 # Heatmaps
-pdf("results/diffbind/06_heatmap_temporal_cd133.pdf", width = 10, height = 12)
 tryCatch({
+    pdf("results/diffbind/05_heatmap_temporal_cd133.pdf", width = 10, height = 12)
     dba.plotHeatmap(dba_cd133, contrast = 1, correlations = FALSE)
+    dev.off()
+    cat("Saved: 05_heatmap_temporal_cd133.pdf\n")
 }, error = function(e) cat("Heatmap error:", e$message, "\n"))
-dev.off()
-
-pdf("results/diffbind/06_heatmap_temporal_all.pdf", width = 10, height = 12)
-tryCatch({
-    dba.plotHeatmap(dba_all, contrast = 1, correlations = FALSE)
-}, error = function(e) cat("Heatmap error:", e$message, "\n"))
-dev.off()
-
-cat("Saved: MA plots, volcano plots, heatmaps\n")
 
 # ==============================================================================
-# 7. Export results
+# 8. Export results
 # ==============================================================================
 
 cat("\n=== Exporting results ===\n")
@@ -198,12 +238,15 @@ export_results(results_temporal_all, "results/diffbind/DAR_temporal_all_all.csv"
 export_results(results_temporal_all_sig, "results/diffbind/DAR_temporal_all_sig.csv")
 export_results(results_regional, "results/diffbind/DAR_regional_e14_all.csv")
 export_results(results_regional_sig, "results/diffbind/DAR_regional_e14_sig.csv")
+export_results(results_ctx_temporal, "results/diffbind/DAR_ctx_temporal_all.csv")
+export_results(results_ctx_temporal_sig, "results/diffbind/DAR_ctx_temporal_sig.csv")
 
 # Save all objects
-save(dba_obj, dba_cd133, dba_all, dba_regional,
+save(dba_obj, dba_cd133, dba_all, dba_regional, dba_ctx,
      results_temporal_cd133, results_temporal_cd133_sig,
      results_temporal_all, results_temporal_all_sig,
      results_regional, results_regional_sig,
+     results_ctx_temporal, results_ctx_temporal_sig,
      file = "results/diffbind/dba_all_results.RData")
 
 cat("\n=== DONE ===\n")
