@@ -20,3 +20,6 @@ __pycache__/
 *err* 
 *out* 
 *RData*
+*motif*
+*data*
+*old_notebooks*
