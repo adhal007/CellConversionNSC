@@ -98,13 +98,20 @@ class GRNPruner:
         return df
     
     def _filter_by_de(self, edges, stage):
-        """Filter edges where TF or target is DE (using SYMBOLS)."""
+        """Filter edges where BOTH TF AND target are DE (using SYMBOLS)."""
         if stage == 'E14':
-            de_symbols = set(self.deseq[(self.deseq['log2FoldChange'] > self.lfc_threshold) & (self.deseq['padj'] < self.padj_threshold)]['symbol'])
+            de_symbols = set(self.deseq[
+                (self.deseq['log2FoldChange'] > self.lfc_threshold) & 
+                (self.deseq['padj'] < self.padj_threshold)
+            ]['symbol'])
         else:
-            de_symbols = set(self.deseq[(self.deseq['log2FoldChange'] < -self.lfc_threshold) & (self.deseq['padj'] < self.padj_threshold)]['symbol'])
+            de_symbols = set(self.deseq[
+                (self.deseq['log2FoldChange'] < -self.lfc_threshold) & 
+                (self.deseq['padj'] < self.padj_threshold)
+            ]['symbol'])
         
-        return edges[edges['TF'].isin(de_symbols) | edges['target'].isin(de_symbols)].copy()
+        # BOTH TF and target must be DE
+        return edges[edges['TF'].isin(de_symbols) & edges['target'].isin(de_symbols)].copy()
     
     def build_networks(self):
         """Build E14 and E18 TF-TF networks. Returns (e14_grn, e18_grn)."""
