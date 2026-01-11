@@ -23,30 +23,35 @@ class NSCAnalysis:
     Questions addressed:
         1. What are pro-neural and pro-glial signatures?
         2. What factors can convert glial to neuronal?
+
+    Enhanced with loading of the Chip seq bed files
     """
     def __init__(
         self,
         counts_path: str,
         metadata_path: str,
-        atac_metadata_path: str,  # <-- NEW
+        atac_metadata_path: str,
         overlap_df_path: str,
         chip_annotated_path: str,
         atac_annotated_path: str,
         tf_list_path: str,
         gtf_path: str,
+        chip_peaks_path: str = None,  # NEW
         exclude_samples: List[str] = None
     ):
         # Store paths
         self.paths = {
             'counts': Path(counts_path),
             'metadata': Path(metadata_path),
-            'atac_metadata': Path(atac_metadata_path),  # <-- NEW
+            'atac_metadata': Path(atac_metadata_path),
             'overlap_df': Path(overlap_df_path),
             'chip_annotated': Path(chip_annotated_path),
             'atac_annotated': Path(atac_annotated_path),
             'tf_list': Path(tf_list_path),
-            'gtf': Path(gtf_path)
+            'gtf': Path(gtf_path),
+            'chip_peaks': Path(chip_peaks_path) if chip_peaks_path else None  # NEW
         }
+        
         
         # Validate paths exist
         for name, path in self.paths.items():
@@ -80,6 +85,10 @@ class NSCAnalysis:
         self.gene_lengths = None
         self.tpm = None
         self.fpkm = None
+        
+        # NEW containers
+        self.promoters = None
+        self.chip_peaks = None
         
         # Load data
         self._load_data()
@@ -181,6 +190,89 @@ class NSCAnalysis:
         print("Data loaded successfully!")
         print("=" * 60)
 
+        # 12. Generate promoters from GTF
+        print("\n[12/13] Generating promoters from GTF...")
+        self.promoters = self._get_promoters_from_gtf(window=2000)
+        print(f"      {len(self.promoters)} promoters")
+        
+        # 13. Load ChIP peaks (if provided)
+        if self.paths['chip_peaks'] and self.paths['chip_peaks'].exists():
+            print("\n[13/13] Loading ChIP-seq peaks...")
+            self.chip_peaks = self._load_chip_peaks()
+            print(f"      {len(self.chip_peaks)} peaks")
+            print(f"      {self.chip_peaks['TF'].nunique()} unique TFs")
+        else:
+            print("\n[13/13] No ChIP peaks file provided, skipping...")
+            self.chip_peaks = None
+        
+        print("\n" + "=" * 60)
+        print("All data loaded successfully!")
+        print("=" * 60)
+    
+        
+
+    def _get_promoters_from_gtf(self, window=2000):
+        """Extract promoter regions (TSS ± window) from GTF."""
+        promoters = []
+        
+        with open(self.paths['gtf']) as f:
+            for line in f:
+                if line.startswith('#'):
+                    continue
+                
+                fields = line.strip().split('\t')
+                if fields[2] != 'gene':
+                    continue
+                
+                chrom = fields[0]
+                start = int(fields[3])
+                end = int(fields[4])
+                strand = fields[6]
+                
+                # Extract gene symbol
+                attrs = {}
+                for item in fields[8].split(';'):
+                    if not item.strip():
+                        continue
+                    key_val = item.strip().split(' ', 1)
+                    if len(key_val) == 2:
+                        attrs[key_val[0]] = key_val[1].strip('"')
+                
+                gene_name = attrs.get('gene_name', '')
+                
+                # Get TSS based on strand
+                if strand == '+':
+                    tss = start
+                else:
+                    tss = end
+                
+                # Promoter = TSS ± window
+                promoters.append({
+                    'chr': chrom,
+                    'start': max(0, tss - window),
+                    'end': tss + window,
+                    'gene': gene_name,
+                    'strand': strand
+                })
+        
+        return pd.DataFrame(promoters)
+    
+    def _load_chip_peaks(self):
+        """Load ChIP-seq peaks from BED file."""
+        # Read file, skip track line
+        chip_peaks = pd.read_csv(self.paths['chip_peaks'], sep='\t', header=None, skiprows=1,
+                                 names=['chr', 'start', 'end', 'metadata', 'score', 'strand', 
+                                        'thickStart', 'thickEnd', 'itemRgb'])
+        
+        # Extract TF name from metadata (Name=TF%20(@%20cell))
+        chip_peaks['TF'] = chip_peaks['metadata'].str.extract(r'Name=([^%]+)')[0]
+        chip_peaks['TF'] = chip_peaks['TF'].str.strip()
+        
+        # Keep only needed columns
+        chip_peaks = chip_peaks[['chr', 'start', 'end', 'TF', 'score']].copy()
+        
+        return chip_peaks
+    
     def _filter_low_counts(
         self,
         min_counts: int = 10,
@@ -1790,3 +1882,133 @@ class NSCAnalysis:
             'signal_matrix': self.atac_signal_matrix,
             'signal_matrix_filtered': self.atac_signal_matrix_filtered
         }
+    
+    def quantify_atac_at_enhancers(self, enhancer_df, consensus_peaks, atac_metadata, 
+                                    group_col='Stage', condition1='E14', condition2='E18'):
+        """
+        Quantify ATAC-seq signal at enhancers for two conditions
+        
+        Parameters:
+        -----------
+        enhancer_df : pd.DataFrame
+            Enhancer database from load_enhancer_database()
+        consensus_peaks : pd.DataFrame
+            Consensus peaks with columns: chr, start, end, and condition-specific columns
+        atac_metadata : pd.DataFrame
+            ATAC metadata with condition labels
+        
+        Returns:
+        --------
+        tuple of (enhancer_atac_e14, enhancer_atac_e18, enhancer_df_with_atac)
+            - Series with ATAC signal per enhancer for each condition
+            - enhancer_df with added atac_signal_e14 and atac_signal_e18 columns
+        """
+        
+        print(f"\nQuantifying ATAC-seq signal at enhancers...")
+        
+        # Get unique enhancers
+        unique_enhancers = enhancer_df[['enhancer_id', 'enhancer_chr', 
+                                        'enhancer_start', 'enhancer_end']].drop_duplicates()
+        
+        print(f"Unique enhancers: {len(unique_enhancers)}")
+        
+
+        
+        enhancer_bed = pybedtools.BedTool.from_dataframe(
+            unique_enhancers.rename(columns={
+                'enhancer_chr': 'chr',
+                'enhancer_start': 'start', 
+                'enhancer_end': 'end'
+            })[['chr', 'start', 'end', 'enhancer_id']]
+        )
+        
+        consensus_bed = pybedtools.BedTool.from_dataframe(
+            consensus_peaks[['chr', 'start', 'end']]
+        )
+        
+        # Find overlaps
+        overlaps = enhancer_bed.intersect(consensus_bed, wa=True, wb=True)
+        
+        # Parse overlaps and extract sample-specific signals
+        overlap_data = []
+        for interval in overlaps:
+            enh_chr = interval.fields[0]
+            enh_start = int(interval.fields[1])
+            enh_end = int(interval.fields[2])
+            enh_id = interval.fields[3]
+            
+            peak_chr = interval.fields[4]
+            peak_start = int(interval.fields[5])
+            peak_end = int(interval.fields[6])
+            
+            # Find this peak in consensus_peaks to get signal values
+            peak_match = consensus_peaks[
+                (consensus_peaks['chr'] == peak_chr) &
+                (consensus_peaks['start'] == peak_start) &
+                (consensus_peaks['end'] == peak_end)
+            ]
+            
+            if len(peak_match) > 0:
+                overlap_data.append({
+                    'enhancer_id': enh_id,
+                    'peak_idx': peak_match.index[0]
+                })
+        
+        overlap_df = pd.DataFrame(overlap_data)
+        
+        # Get sample columns from consensus peaks
+        sample_cols = [col for col in consensus_peaks.columns 
+                    if col not in ['chr', 'start', 'end', 'peak_id']]
+        
+        # Separate E14 and E18 samples
+        e14_samples = atac_metadata[atac_metadata[group_col] == condition1].index.tolist()
+        e18_samples = atac_metadata[atac_metadata[group_col] == condition2].index.tolist()
+        
+        # Filter to available sample columns
+        e14_cols = [col for col in sample_cols if any(s in col for s in e14_samples)]
+        e18_cols = [col for col in sample_cols if any(s in col for s in e18_samples)]
+        
+        print(f"E14 samples: {len(e14_cols)}")
+        print(f"E18 samples: {len(e18_cols)}")
+        
+        # Calculate mean ATAC signal per enhancer
+        enhancer_atac = {}
+        
+        for enh_id in unique_enhancers['enhancer_id']:
+            # Get all peaks overlapping this enhancer
+            peak_indices = overlap_df[overlap_df['enhancer_id'] == enh_id]['peak_idx'].tolist()
+            
+            if len(peak_indices) > 0:
+                # Mean signal across overlapping peaks, then across samples
+                e14_signal = consensus_peaks.loc[peak_indices, e14_cols].mean().mean()
+                e18_signal = consensus_peaks.loc[peak_indices, e18_cols].mean().mean()
+            else:
+                e14_signal = 0
+                e18_signal = 0
+            
+            enhancer_atac[enh_id] = {
+                'atac_e14': e14_signal,
+                'atac_e18': e18_signal
+            }
+        
+        # Convert to Series
+        enhancer_atac_e14 = pd.Series({k: v['atac_e14'] for k, v in enhancer_atac.items()})
+        enhancer_atac_e18 = pd.Series({k: v['atac_e18'] for k, v in enhancer_atac.items()})
+        
+        # Add to enhancer_df
+        enhancer_df_with_atac = enhancer_df.copy()
+        enhancer_df_with_atac['atac_signal_e14'] = enhancer_df_with_atac['enhancer_id'].map(
+            enhancer_atac_e14
+        )
+        enhancer_df_with_atac['atac_signal_e18'] = enhancer_df_with_atac['enhancer_id'].map(
+            enhancer_atac_e18
+        )
+        
+        # Fill NaN with 0
+        enhancer_df_with_atac['atac_signal_e14'].fillna(0, inplace=True)
+        enhancer_df_with_atac['atac_signal_e18'].fillna(0, inplace=True)
+        
+        print(f"\nEnhancers with ATAC signal > 0 (E14): {(enhancer_atac_e14 > 0).sum()}")
+        print(f"Enhancers with ATAC signal > 0 (E18): {(enhancer_atac_e18 > 0).sum()}")
+        
+        return enhancer_atac_e14, enhancer_atac_e18, enhancer_df_with_atac
