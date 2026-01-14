@@ -7,6 +7,9 @@ import numpy as np
 import networkx as nx
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
+import pybedtools
+from tqdm import tqdm
+
 class GRNCo:
     """
     Wrapper for CellOracle TF motif scanning on ATAC peaks.
@@ -100,492 +103,531 @@ class GRNCo:
         df.to_parquet(parquet_path)
         return df
 
+
+def sigmoid(x):
+    """Sigmoid function."""
+    return 1 / (1 + np.exp(-x))
+
+
 class GRNBuilder:
     """
-    Build Gene Regulatory Networks from multi-omics data.
-    
-    Combines RNA-seq, ATAC-seq, ChIP-seq, and enhancer predictions
-    to construct condition-specific GRNs.
+    Build condition-specific GRNs using:
+    - TF-target prior (chip_all_mouse)
+    - RNA-seq DE (binary indicators)
+    - DA peaks (binary indicators)
+    - ChIP peaks (ReMap binding evidence)
+    - Regulatory regions (enhancers + promoters)
     """
     
-    def __init__(self, 
-                 deseq_results,
-                 consensus_peaks,
-                 dar_results,
-                 promoters,
-                 enhancers,
-                 chip_peaks,
-                 output_dir):
+    def __init__(self, deseq_results, consensus_peaks, dar_results, 
+                 merged_regulatory, remap_peaks, tf_target_df, output_dir):
         """
-        Initialize GRN builder with all required data.
+        Initialize GRN builder.
         
         Args:
-            deseq_results: DataFrame with DE analysis (columns: symbol, log2FoldChange, padj, is_TF)
-            consensus_peaks: DataFrame with consensus ATAC peaks (columns: Chromosome, Start, End)
-            dar_results: DataFrame with DA peaks (columns: seqnames, start, end, Fold, FDR, ...)
-            promoters: DataFrame with promoter regions (columns: chr, start, end, gene)
-            enhancers: DataFrame with enhancer regions (columns: chr, start, end, symbol)
-            chip_peaks: DataFrame with ChIP-seq peaks (columns: chr, start, end, TF, score)
-            output_dir: Path to save output files
+            deseq_results: DESeq2 results with columns [symbol, log2FoldChange, padj, is_TF]
+            consensus_peaks: ATAC consensus peaks
+            dar_results: DA peaks with columns [seqnames, start, end, Fold]
+            merged_regulatory: Merged regulatory regions [chr, start, end, gene, region_type]
+            remap_peaks: ReMap peaks [chr, start, end, TF]
+            tf_target_df: TF-target prior network [TF, Target]
+            output_dir: Output directory
         """
         self.deseq_results = deseq_results
         self.consensus_peaks = consensus_peaks
         self.dar_results = dar_results
-        self.promoters = promoters
-        self.enhancers = enhancers
-        self.chip_peaks = chip_peaks
+        self.merged_regulatory = merged_regulatory
+        self.remap_peaks = remap_peaks
+        self.tf_target_df = tf_target_df
         self.output_dir = output_dir
         
-        # Create output directory
         os.makedirs(output_dir, exist_ok=True)
-        
-        # Validate inputs
-        self._validate_inputs()
         
         print("="*80)
         print("GRN Builder Initialized")
         print("="*80)
-        print(f"DE results: {len(self.deseq_results)} genes")
-        print(f"  DE genes: {((self.deseq_results['padj'] < 0.05) & (self.deseq_results['log2FoldChange'].abs() > 1)).sum()}")
-        print(f"  DE TFs: {((self.deseq_results['padj'] < 0.05) & (self.deseq_results['log2FoldChange'].abs() > 1) & (self.deseq_results['is_TF'])).sum()}")
-        print(f"Consensus peaks: {len(self.consensus_peaks)}")
+        print(f"DE results: {len(deseq_results)} genes")
+        print(f"Regulatory regions: {len(merged_regulatory)}")
+        print(f"ReMap peaks: {len(remap_peaks)}")
+        print(f"TF-target prior: {len(tf_target_df)} edges")
+    
+    def compute_de_indicators(self, tau_lfc=1.0, tau_padj=0.05):
+        """
+        Step 1: Compute binary DE indicators E_x(c).
+        
+        Returns:
+            E_E14_dict, E_E18_dict: Gene -> binary DE indicator
+        """
+        print("\n" + "="*80)
+        print("STEP 1: BINARY DE INDICATORS")
+        print("="*80)
+        
+        # E14: positive logFC
+        self.deseq_results['E_E14'] = (
+            (self.deseq_results['log2FoldChange'] > tau_lfc) & 
+            (self.deseq_results['padj'] < tau_padj)
+        ).astype(int)
+        
+        # E18: negative logFC
+        self.deseq_results['E_E18'] = (
+            (self.deseq_results['log2FoldChange'] < -tau_lfc) & 
+            (self.deseq_results['padj'] < tau_padj)
+        ).astype(int)
+        
+        print(f"E14 DE genes: {self.deseq_results['E_E14'].sum()}")
+        print(f"E18 DE genes: {self.deseq_results['E_E18'].sum()}")
+        
+        # Create lookup dictionaries
+        self.E_E14_dict = self.deseq_results.set_index('symbol')['E_E14'].to_dict()
+        self.E_E18_dict = self.deseq_results.set_index('symbol')['E_E18'].to_dict()
+        
+        # Store DE gene lists
+        e14_cond = (self.deseq_results['padj'] < tau_padj) & (self.deseq_results['log2FoldChange'] > tau_lfc)
+        e18_cond = (self.deseq_results['padj'] < tau_padj) & (self.deseq_results['log2FoldChange'] < -tau_lfc)
+        
+        self.de_e14_tfs = self.deseq_results[e14_cond & self.deseq_results['is_TF']]['symbol'].to_numpy()
+        self.de_e18_tfs = self.deseq_results[e18_cond & self.deseq_results['is_TF']]['symbol'].to_numpy()
+        self.de_e14_genes = self.deseq_results[e14_cond]['symbol'].to_numpy()
+        self.de_e18_genes = self.deseq_results[e18_cond]['symbol'].to_numpy()
+        
+        return self.E_E14_dict, self.E_E18_dict
+    
+    def compute_da_indicators(self):
+        """
+        Step 2: Compute binary DA indicators D_r(c) for each regulatory element.
+        
+        Returns:
+            merged_regulatory with D_E14, D_E18 columns
+        """
+        print("\n" + "="*80)
+        print("STEP 2: BINARY DA INDICATORS PER ELEMENT")
+        print("="*80)
+        
+        print(f"Merged regulatory elements: {len(self.merged_regulatory)}")
         print(f"DA peaks: {len(self.dar_results)}")
-        print(f"Promoters: {len(self.promoters)}")
-        print(f"Enhancers: {len(self.enhancers)}")
-        print(f"ChIP peaks: {len(self.chip_peaks)}")
-        print(f"  Unique TFs: {self.chip_peaks['TF'].nunique()}")
-        print(f"Output: {self.output_dir}")
-    
-    def _validate_inputs(self):
-        """Validate that all inputs have required columns."""
-        required_cols = {
-            'deseq_results': ['symbol', 'log2FoldChange', 'padj', 'is_TF'],
-            'consensus_peaks': ['Chromosome', 'Start', 'End'],
-            'dar_results': ['seqnames', 'start', 'end', 'Fold'],
-            'promoters': ['chr', 'start', 'end', 'gene'],
-            'enhancers': ['chr', 'start', 'end', 'symbol'],
-            'chip_peaks': ['chr', 'start', 'end', 'TF']
-        }
         
-        for df_name, cols in required_cols.items():
-            df = getattr(self, df_name)
-            missing = set(cols) - set(df.columns)
-            if missing:
-                raise ValueError(f"{df_name} missing columns: {missing}")
-        
-        print("\n✓ All inputs validated")
-
-    # Add this method to the GRNBuilder class in base_grn.py
-
-    def identify_accessible_regulatory_regions(self, de_only=True, padj_cutoff=0.05, lfc_cutoff=1):
-        """
-        Identify accessible regulatory regions (promoters + enhancers) for genes.
-        
-        Args:
-            de_only: If True, only consider DE genes
-            padj_cutoff: FDR cutoff for DE genes
-            lfc_cutoff: Log2 fold-change cutoff for DE genes
-        
-        Returns:
-            DataFrame with accessible regulatory regions and DA annotation
-        """
-        import pyranges as pr
-        
-        print("\n" + "="*80)
-        print("IDENTIFYING ACCESSIBLE REGULATORY REGIONS")
-        print("="*80)
-        
-        # Get target genes
-        if de_only:
-            target_genes = self.deseq_results[
-                (self.deseq_results['padj'] < padj_cutoff) & 
-                (self.deseq_results['log2FoldChange'].abs() > lfc_cutoff)
-            ]['symbol'].tolist()
-            print(f"Target: {len(target_genes)} DE genes")
-        else:
-            target_genes = self.deseq_results['symbol'].tolist()
-            print(f"Target: All {len(target_genes)} genes")
-        
-        # Filter promoters and enhancers
-        promoters_target = self.promoters[self.promoters['gene'].isin(target_genes)]
-        enhancers_target = self.enhancers[self.enhancers['symbol'].isin(target_genes)]
-        
-        print(f"Promoters: {len(promoters_target)}")
-        print(f"Enhancers: {len(enhancers_target)}")
-        
-        # Convert to PyRanges
-        consensus_pr = pr.PyRanges(self.consensus_peaks)
-        
-        promoters_pr = pr.PyRanges(promoters_target.rename(
-            columns={'chr': 'Chromosome', 'start': 'Start', 'end': 'End'}
-        ))
-        
-        enhancers_pr = pr.PyRanges(enhancers_target.rename(
-            columns={'chr': 'Chromosome', 'start': 'Start', 'end': 'End'}
-        ))
-        
-        # Find accessible regions
-        accessible_promoters = promoters_pr.join(consensus_pr).df
-        accessible_enhancers = enhancers_pr.join(consensus_pr).df
-        
-        print(f"\nAccessible promoters: {len(accessible_promoters)}")
-        print(f"Accessible enhancers: {len(accessible_enhancers)}")
-        
-        # Combine using consensus peak coordinates (Start_b, End_b)
-        regulatory_regions = pd.concat([
-            accessible_promoters[['Chromosome', 'Start_b', 'End_b', 'gene']].rename(
-                columns={'Start_b': 'Start', 'End_b': 'End'}
-            ),
-            accessible_enhancers[['Chromosome', 'Start_b', 'End_b', 'symbol']].rename(
-                columns={'Start_b': 'Start', 'End_b': 'End', 'symbol': 'gene'}
-            )
-        ], ignore_index=True)
-        
-        # Add peak_id
-        regulatory_regions['peak_id'] = (
-            regulatory_regions['Chromosome'].astype(str) + ':' + 
-            regulatory_regions['Start'].astype(str) + '-' + 
-            regulatory_regions['End'].astype(str)
+        # Overlap merged_regulatory with dar_results
+        reg_bed = pybedtools.BedTool.from_dataframe(
+            self.merged_regulatory[['chr', 'start', 'end', 'gene', 'region_type']]
         )
         
-        print(f"\nTotal accessible regulatory regions: {len(regulatory_regions)}")
-        print(f"Unique genes: {regulatory_regions['gene'].nunique()}")
-        
-        # Annotate with DA status
-        print("\nAnnotating DA status...")
-        regulatory_regions = self._annotate_da_status(regulatory_regions)
-        
-        # Store results
-        self.regulatory_regions = regulatory_regions
-        
-        return regulatory_regions
-
-    def _annotate_da_status(self, regulatory_regions):
-        """Annotate regulatory regions with DA status."""
-
-        
-        # Separate E14 and E18 DA peaks
-        dar_e14 = self.dar_results[self.dar_results['Fold'] > 0].copy()
-        dar_e18 = self.dar_results[self.dar_results['Fold'] < 0].copy()
-        
-        print(f"  E14 DA peaks: {len(dar_e14)}")
-        print(f"  E18 DA peaks: {len(dar_e18)}")
-        
-        # Convert to PyRanges
-        consensus_pr = pr.PyRanges(self.consensus_peaks)
-        dar_e14_pr = pr.PyRanges(dar_e14.rename(columns={'seqnames': 'Chromosome', 'start': 'Start', 'end': 'End'}))
-        dar_e18_pr = pr.PyRanges(dar_e18.rename(columns={'seqnames': 'Chromosome', 'start': 'Start', 'end': 'End'}))
-        
-        # Find consensus peaks overlapping DA
-        consensus_da_e14 = consensus_pr.join(dar_e14_pr).df
-        consensus_da_e18 = consensus_pr.join(dar_e18_pr).df
-        
-        # Get DA peak IDs
-        e14_da_peak_ids = set(
-            consensus_da_e14['Chromosome'].astype(str) + ':' + 
-            consensus_da_e14['Start'].astype(str) + '-' + 
-            consensus_da_e14['End'].astype(str)
+        dar_bed = pybedtools.BedTool.from_dataframe(
+            self.dar_results[['seqnames', 'start', 'end', 'Fold']].rename(columns={'seqnames': 'chr'})
         )
         
-        e18_da_peak_ids = set(
-            consensus_da_e18['Chromosome'].astype(str) + ':' + 
-            consensus_da_e18['Start'].astype(str) + '-' + 
-            consensus_da_e18['End'].astype(str)
-        )
+        reg_da_overlap = reg_bed.intersect(dar_bed, wa=True, wb=True)
         
-        # Annotate
-        regulatory_regions['is_E14_DA'] = regulatory_regions['peak_id'].isin(e14_da_peak_ids)
-        regulatory_regions['is_E18_DA'] = regulatory_regions['peak_id'].isin(e18_da_peak_ids)
+        print(f"Computing DA overlap...")
         
-        print(f"  Regions with E14 DA: {regulatory_regions['is_E14_DA'].sum()}")
-        print(f"  Regions with E18 DA: {regulatory_regions['is_E18_DA'].sum()}")
+        # Parse overlaps
+        element_da_status = {}
+        for interval in tqdm(reg_da_overlap):
+            element_key = (interval[0], int(interval[1]), int(interval[2]), interval[3])
+            da_fold = float(interval[8])
+            
+            # Keep max absolute fold change
+            if element_key not in element_da_status:
+                element_da_status[element_key] = da_fold
+            else:
+                if abs(da_fold) > abs(element_da_status[element_key]):
+                    element_da_status[element_key] = da_fold
         
-        return regulatory_regions
-    
-    # Add this method to GRNBuilder class in base_grn.py
-
-    def build_chip_edges(self):
-        """
-        Build TF→Gene edges by overlapping ChIP peaks with accessible regulatory regions.
+        print(f"Elements with DA overlap: {len(element_da_status)}")
         
-        Returns:
-            DataFrame with TF→Gene edges
-        """
-        
-        print("\n" + "="*80)
-        print("BUILDING TF→GENE EDGES FROM ChIP-SEQ")
-        print("="*80)
-        
-        if self.regulatory_regions is None:
-            raise ValueError("Run identify_accessible_regulatory_regions() first!")
-        
-        print(f"ChIP peaks: {len(self.chip_peaks)}")
-        print(f"ChIP TFs: {self.chip_peaks['TF'].nunique()}")
-        print(f"Regulatory regions: {len(self.regulatory_regions)}")
-        
-        # Convert to PyRanges
-        chip_pr = pr.PyRanges(self.chip_peaks.rename(
-            columns={'chr': 'Chromosome', 'start': 'Start', 'end': 'End'}
+        # Add to merged_regulatory
+        self.merged_regulatory['element_key_tuple'] = list(zip(
+            self.merged_regulatory['chr'],
+            self.merged_regulatory['start'],
+            self.merged_regulatory['end'],
+            self.merged_regulatory['gene']
         ))
         
-        regulatory_pr = pr.PyRanges(self.regulatory_regions[[
-            'Chromosome', 'Start', 'End', 'gene', 'is_E14_DA', 'is_E18_DA'
-        ]])
+        self.merged_regulatory['da_fold'] = self.merged_regulatory['element_key_tuple'].map(
+            lambda k: element_da_status.get(k, 0)
+        )
         
-        # Overlap ChIP with regulatory regions
-        print("\nOverlapping ChIP peaks with regulatory regions...")
-        chip_regulatory_overlap = regulatory_pr.join(chip_pr).df
+        # Binary indicators
+        self.merged_regulatory['D_E14'] = (self.merged_regulatory['da_fold'] > 0).astype(int)
+        self.merged_regulatory['D_E18'] = (self.merged_regulatory['da_fold'] < 0).astype(int)
         
-        print(f"Overlapping regions: {len(chip_regulatory_overlap)}")
+        print(f"\nResults:")
+        print(f"  Elements with DA: {(self.merged_regulatory['da_fold'] != 0).sum()}")
+        print(f"  Elements with E14 DA: {self.merged_regulatory['D_E14'].sum()}")
+        print(f"  Elements with E18 DA: {self.merged_regulatory['D_E18'].sum()}")
         
-        # Build edges: TF → Gene
-        edges = chip_regulatory_overlap[[
-            'TF', 'gene', 'Chromosome', 'Start', 'End', 'is_E14_DA', 'is_E18_DA'
-        ]].copy()
-        
-        # Remove duplicate TF-gene pairs
-        edges = edges.drop_duplicates(subset=['TF', 'gene'])
-        
-        print(f"\nBase edges: {len(edges)}")
-        print(f"Unique TFs: {edges['TF'].nunique()}")
-        print(f"Unique target genes: {edges['gene'].nunique()}")
-        print(f"Edges with E14 DA: {edges['is_E14_DA'].sum()}")
-        print(f"Edges with E18 DA: {edges['is_E18_DA'].sum()}")
-        
-        # Store results
-        self.base_edges = edges
-        
-        return edges
+        return self.merged_regulatory
     
-    # Add this method to GRNBuilder class in base_grn.py
-
-    def filter_by_tf_expression(self, padj_cutoff=0.05, lfc_cutoff=1):
+    def compute_chip_binding(self):
         """
-        Filter edges to only include DE TFs.
-        
-        Args:
-            padj_cutoff: FDR cutoff for DE TFs
-            lfc_cutoff: Log2 fold-change cutoff for DE TFs
+        Step 3: Compute TF-element binding B_{t,r} from ReMap.
         
         Returns:
-            DataFrame with filtered edges
+            chip_overlap_df with columns [TF, element_key]
         """
         print("\n" + "="*80)
-        print("FILTERING BY TF EXPRESSION")
+        print("STEP 3: TF-ELEMENT BINDING B_{t,r} (ReMap)")
         print("="*80)
         
-        if self.base_edges is None:
-            raise ValueError("Run build_chip_edges() first!")
+        # Create element_key string
+        self.merged_regulatory['element_key'] = (
+            self.merged_regulatory['chr'].astype(str) + ':' +
+            self.merged_regulatory['start'].astype(str) + '-' +
+            self.merged_regulatory['end'].astype(str)
+        )
         
-        print(f"Base edges: {len(self.base_edges)}")
+        remap_bed = pybedtools.BedTool.from_dataframe(
+            self.remap_peaks[['chr', 'start', 'end', 'TF']]
+        )
         
-        # Get DE TFs
-        de_tfs = self.deseq_results[
-            (self.deseq_results['padj'] < padj_cutoff) & 
-            (self.deseq_results['log2FoldChange'].abs() > lfc_cutoff) & 
-            (self.deseq_results['is_TF'])
+        regulatory_bed = pybedtools.BedTool.from_dataframe(
+            self.merged_regulatory[['chr', 'start', 'end', 'element_key']]
+        )
+        
+        # Intersect
+        chip_overlap = remap_bed.intersect(regulatory_bed, wa=True, wb=True)
+        
+        # Convert to DataFrame
+        self.chip_overlap_df = chip_overlap.to_dataframe(
+            names=['chr_tf', 'start_tf', 'end_tf', 'TF',
+                   'chr_el', 'start_el', 'end_el', 'element_key']
+        )
+        
+        # Canonicalize TF names
+        self.chip_overlap_df['TF'] = self.chip_overlap_df['TF'].str.upper()
+        
+        print(f"TF-element overlaps: {len(self.chip_overlap_df):,}")
+        print(f"Unique TFs with binding: {self.chip_overlap_df['TF'].nunique()}")
+        print(f"Unique elements bound: {self.chip_overlap_df['element_key'].nunique()}")
+        
+        return self.chip_overlap_df
+    
+    def build_condition_grns(self):
+        """
+        Step 4: Build condition-specific GRNs.
+        
+        Combines:
+        - TF ChIP binding (ReMap)
+        - DA regulatory elements
+        - DE genes (TF and target)
+        - TF-target prior network
+        
+        Returns:
+            grn_e14, grn_e18: Condition-specific GRNs
+        """
+        print("\n" + "="*80)
+        print("STEP 4: BUILD CONDITION-SPECIFIC GRNs")
+        print("="*80)
+        
+        # E14: DE TFs with ChIP binding
+        e14_chip_df = self.chip_overlap_df[
+            self.chip_overlap_df['TF'].isin([tf.upper() for tf in self.de_e14_tfs])
+        ].reset_index(drop=True)
+        
+        # E18: DE TFs with ChIP binding
+        e18_chip_df = self.chip_overlap_df[
+            self.chip_overlap_df['TF'].isin([tf.upper() for tf in self.de_e18_tfs])
+        ].reset_index(drop=True)
+        
+        print(f"E14 TFs with ChIP: {e14_chip_df['TF'].nunique()}")
+        print(f"E18 TFs with ChIP: {e18_chip_df['TF'].nunique()}")
+        
+        # Get DA regions for DE genes
+        e14_DA_de_df = self.merged_regulatory[
+            self.merged_regulatory['gene'].isin(self.de_e14_genes)
+        ].reset_index(drop=True)
+        
+        e18_DA_de_df = self.merged_regulatory[
+            self.merged_regulatory['gene'].isin(self.de_e18_genes)
+        ].reset_index(drop=True)
+        
+        # Merge: TF ChIP + DA element + DE gene
+        e14_tf_target_de_da = pd.merge(
+            e14_chip_df,
+            e14_DA_de_df[e14_DA_de_df['D_E14'] == 1],
+            on='element_key'
+        )
+        
+        e18_tf_target_de_da = pd.merge(
+            e18_chip_df,
+            e18_DA_de_df[e18_DA_de_df['D_E18'] == 1],
+            on='element_key'
+        )
+        
+        print(f"\nE14 TF→gene pairs (ChIP + DA + DE): {len(e14_tf_target_de_da)}")
+        print(f"E18 TF→gene pairs (ChIP + DA + DE): {len(e18_tf_target_de_da)}")
+        
+        grn_e14 = e14_tf_target_de_da[['TF', 'gene']].drop_duplicates()
+        grn_e18 = e18_tf_target_de_da[['TF', 'gene']].drop_duplicates()
+        
+        # Add TF-target prior edges where both TF and target are in GRN
+        print(f"\nAdding TF-TF prior edges...")
+        
+        # E14
+        TF_target_df_sub_e14 = self.tf_target_df[
+            (self.tf_target_df['TF'].isin(grn_e14['TF'])) &
+            (self.tf_target_df['Target'].isin(grn_e14['TF']))
         ]
         
-        print(f"DE TFs: {len(de_tfs)}")
-        print(f"  E14 (LFC > {lfc_cutoff}): {(de_tfs['log2FoldChange'] > lfc_cutoff).sum()}")
-        print(f"  E18 (LFC < -{lfc_cutoff}): {(de_tfs['log2FoldChange'] < -lfc_cutoff).sum()}")
+        grn_e14_for_merge = grn_e14.copy()
+        grn_e14_for_merge['gene'] = grn_e14_for_merge['gene'].str.upper()
+        grn_e14_for_merge.columns = ['TF', 'Target']
         
-        # Filter edges
-        edges_filtered = self.base_edges[
-            self.base_edges['TF'].str.upper().isin(de_tfs['symbol'].str.upper())
-        ].copy()
+        self.grn_e14 = pd.concat([
+            TF_target_df_sub_e14[['TF', 'Target']],
+            grn_e14_for_merge
+        ]).drop_duplicates()
         
-        print(f"\nFiltered edges: {len(edges_filtered)}")
-        print(f"Unique DE TFs: {edges_filtered['TF'].nunique()}")
-        print(f"Unique targets: {edges_filtered['gene'].nunique()}")
+        # Remove autoregulation
+        self.grn_e14 = self.grn_e14[self.grn_e14['TF'] != self.grn_e14['Target']].reset_index(drop=True)
+        self.grn_e14.columns = ['TF', 'gene']
         
-        # Add TF direction (E14 vs E18)
-        tf_direction = dict(zip(
-            de_tfs['symbol'].str.upper(), 
-            ['E14' if lfc > 0 else 'E18' for lfc in de_tfs['log2FoldChange']]
-        ))
-        
-        edges_filtered['TF_direction'] = edges_filtered['TF'].str.upper().map(tf_direction)
-        
-        print(f"\nE14 TFs: {(edges_filtered['TF_direction'] == 'E14').sum()} edges")
-        print(f"E18 TFs: {(edges_filtered['TF_direction'] == 'E18').sum()} edges")
-        
-        # Store results
-        self.filtered_edges = edges_filtered
-        
-        return edges_filtered
-    
-    # Add this method to GRNBuilder class in base_grn.py
-
-    def split_by_condition(self):
-        """
-        Split filtered edges into condition-specific GRNs (E14 vs E18).
-        
-        Returns:
-            Tuple of (e14_grn, e18_grn) DataFrames
-        """
-        print("\n" + "="*80)
-        print("SPLITTING INTO CONDITION-SPECIFIC GRNs")
-        print("="*80)
-        
-        if self.filtered_edges is None:
-            raise ValueError("Run filter_by_tf_expression() first!")
-        
-        # Separate by TF direction
-        e14_grn = self.filtered_edges[self.filtered_edges['TF_direction'] == 'E14'].copy()
-        e18_grn = self.filtered_edges[self.filtered_edges['TF_direction'] == 'E18'].copy()
-        
-        print(f"\nE14 GRN:")
-        print(f"  Edges: {len(e14_grn)}")
-        print(f"  TFs: {e14_grn['TF'].nunique()}")
-        print(f"  Target genes: {e14_grn['gene'].nunique()}")
-        print(f"  Edges with DA: {e14_grn['is_E14_DA'].sum()} ({100*e14_grn['is_E14_DA'].sum()/len(e14_grn):.1f}%)")
-        
-        print(f"\nE18 GRN:")
-        print(f"  Edges: {len(e18_grn)}")
-        print(f"  TFs: {e18_grn['TF'].nunique()}")
-        print(f"  Target genes: {e18_grn['gene'].nunique()}")
-        print(f"  Edges with DA: {e18_grn['is_E18_DA'].sum()} ({100*e18_grn['is_E18_DA'].sum()/len(e18_grn):.1f}%)")
-        
-        # Store results
-        self.e14_grn = e14_grn
-        self.e18_grn = e18_grn
-        
-        return e14_grn, e18_grn
-    
-    # Add this method to GRNBuilder class in base_grn.py
-
-    def visualize_networks(self, save=True):
-        """
-        Visualize condition-specific GRNs and identify hubs.
-        
-            Args:
-                save: Whether to save figures
-        """
-
-        
-        print("\n" + "="*80)
-        print("NETWORK VISUALIZATION AND HUB ANALYSIS")
-        print("="*80)
-        
-        if self.e14_grn is None or self.e18_grn is None:
-            raise ValueError("Run split_by_condition() first!")
-        
-        # Build NetworkX graphs
-        G_e14 = nx.from_pandas_edgelist(self.e14_grn, source='TF', target='gene', 
-                                        create_using=nx.DiGraph())
-        G_e18 = nx.from_pandas_edgelist(self.e18_grn, source='TF', target='gene', 
-                                        create_using=nx.DiGraph())
-        
-        # Hub analysis
-        e14_out = dict(G_e14.out_degree())
-        e18_out = dict(G_e18.out_degree())
-        
-        e14_hubs = sorted([(node, deg) for node, deg in e14_out.items() if deg > 0], 
-                        key=lambda x: x[1], reverse=True)
-        e18_hubs = sorted([(node, deg) for node, deg in e18_out.items() if deg > 0], 
-                        key=lambda x: x[1], reverse=True)
-        
-        print("\nE14 Top 10 Hubs:")
-        for i, (tf, n_targets) in enumerate(e14_hubs[:10], 1):
-            da_edges = self.e14_grn[(self.e14_grn['TF'] == tf) & (self.e14_grn['is_E14_DA'])].shape[0]
-            print(f"  {i:2d}. {tf:15s} → {n_targets:4d} targets ({da_edges} with DA)")
-        
-        print("\nE18 Top 10 Hubs:")
-        for i, (tf, n_targets) in enumerate(e18_hubs[:10], 1):
-            da_edges = self.e18_grn[(self.e18_grn['TF'] == tf) & (self.e18_grn['is_E18_DA'])].shape[0]
-            print(f"  {i:2d}. {tf:15s} → {n_targets:4d} targets ({da_edges} with DA)")
-        
-        # Create visualization
-        fig, axes = plt.subplots(1, 2, figsize=(20, 10), facecolor='white')
-        
-        # E14 Network
-        self._plot_network(G_e14, e14_hubs, axes[0], 'E14 Network (Neurogenic)', '#e74c3c')
-        
-        # E18 Network
-        self._plot_network(G_e18, e18_hubs, axes[1], 'E18 Network (Gliogenic)', '#3498db')
-        
-        # Legend
-        legend_elements = [
-            mpatches.Patch(facecolor='#e74c3c', edgecolor='black', label='E14 TFs'),
-            mpatches.Patch(facecolor='#3498db', edgecolor='black', label='E18 TFs'),
-            mpatches.Patch(facecolor='#ecf0f1', edgecolor='black', label='Target genes'),
+        # E18
+        TF_target_df_sub_e18 = self.tf_target_df[
+            (self.tf_target_df['TF'].isin(grn_e18['TF'])) &
+            (self.tf_target_df['Target'].isin(grn_e18['TF']))
         ]
-        fig.legend(handles=legend_elements, loc='upper center', ncol=3, 
-                fontsize=12, frameon=True, fancybox=True)
         
-        plt.suptitle('Gene Regulatory Networks\nE14→E18 Cortical Progenitor Transition', 
-                    fontsize=20, fontweight='bold', y=0.98)
+        grn_e18_for_merge = grn_e18.copy()
+        grn_e18_for_merge['gene'] = grn_e18_for_merge['gene'].str.upper()
+        grn_e18_for_merge.columns = ['TF', 'Target']
         
-        plt.tight_layout(rect=[0, 0, 1, 0.96])
+        self.grn_e18 = pd.concat([
+            TF_target_df_sub_e18[['TF', 'Target']],
+            grn_e18_for_merge
+        ]).drop_duplicates()
         
-        if save:
-            output_path = os.path.join(self.output_dir, 'network_visualization.pdf')
-            plt.savefig(output_path, dpi=300, bbox_inches='tight', facecolor='white')
-            plt.savefig(output_path.replace('.pdf', '.png'), dpi=300, bbox_inches='tight', facecolor='white')
-            print(f"\nSaved: {output_path}")
+        # Remove autoregulation
+        self.grn_e18 = self.grn_e18[self.grn_e18['TF'] != self.grn_e18['Target']].reset_index(drop=True)
+        self.grn_e18.columns = ['TF', 'gene']
         
-        plt.show()
+        print(f"\nFinal GRNs:")
+        print(f"  E14: {len(self.grn_e14)} edges, {self.grn_e14['TF'].nunique()} TFs, {self.grn_e14['gene'].nunique()} targets")
+        print(f"  E18: {len(self.grn_e18)} edges, {self.grn_e18['TF'].nunique()} TFs, {self.grn_e18['gene'].nunique()} targets")
         
-        return e14_hubs, e18_hubs
+        return self.grn_e14, self.grn_e18
+    
+    def save_grns(self):
+        """Save condition-specific GRNs."""
+        e14_path = os.path.join(self.output_dir, 'grn_e14.csv')
+        e18_path = os.path.join(self.output_dir, 'grn_e18.csv')
+        
+        self.grn_e14.to_csv(e14_path, index=False)
+        self.grn_e18.to_csv(e18_path, index=False)
+        
+        print(f"\nSaved:")
+        print(f"  {e14_path}")
+        print(f"  {e18_path}")
 
-    def _plot_network(self, G, hubs, ax, title, color):
-        """Helper function to plot a single network."""
-        
-        out_degree = dict(G.out_degree())
-        tfs = [node for node in G.nodes() if out_degree[node] > 0]
-        targets = [node for node in G.nodes() if out_degree[node] == 0]
-        
-        # Hierarchical layout
-        pos = {}
-        
-        # Place TFs in circle at top
-        tf_angles = np.linspace(0, 2*np.pi, len(tfs), endpoint=False)
-        for i, tf in enumerate(tfs):
-            radius = 2 if len(tfs) <= 10 else 3
-            pos[tf] = (np.cos(tf_angles[i]) * radius, np.sin(tf_angles[i]) * radius + 5)
-        
-        # Place targets in cloud below
-        np.random.seed(42)
-        for target in targets:
-            pos[target] = (np.random.uniform(-8, 8), np.random.uniform(-3, 3))
-        
-        # Node sizes
-        node_sizes = []
-        for node in G.nodes():
-            if node in tfs:
-                node_sizes.append(max(out_degree[node] * 20, 500))
-            else:
-                node_sizes.append(10)
-        
-        # Node colors
-        node_colors = []
-        for node in G.nodes():
-            if node in tfs:
-                node_colors.append(color)
-            else:
-                node_colors.append('#ecf0f1')
-        
-        # Draw
-        nx.draw_networkx_nodes(G, pos, node_color=node_colors, node_size=node_sizes, 
-                            alpha=0.8, ax=ax, edgecolors='black', linewidths=0.5)
-        
-        nx.draw_networkx_edges(G, pos, edge_color='#95a5a6', alpha=0.2, 
-                            arrows=True, arrowsize=5, ax=ax, width=0.3,
-                            connectionstyle='arc3,rad=0.1')
-        
-        # Label only TFs
-        tf_labels = {tf: tf for tf in tfs}
-        nx.draw_networkx_labels(G, pos, labels=tf_labels, font_size=10 if len(tfs) > 10 else 12, 
-                            font_weight='bold', ax=ax)
-        
-        ax.set_title(title, fontsize=18, fontweight='bold', pad=20)
-        ax.axis('off')
-        ax.set_xlim(-10, 10)
-        ax.set_ylim(-5, 8)
-        
-        # Add stats
-        stats_text = f'{len(tfs)} TFs\n{len(targets)} targets\n{G.number_of_edges()} edges'
-        ax.text(0.02, 0.98, stats_text, transform=ax.transAxes, 
-                fontsize=11, va='top', ha='left',
-                bbox=dict(boxstyle='round', facecolor='white', alpha=0.8, edgecolor='black'))
+# import numpy as np
+# import pandas as pd
+# from tqdm import tqdm 
+# def sigmoid(x):
+#     """Sigmoid function."""
+#     return 1 / (1 + np.exp(-x))
+
+# # ==============================================================================
+# # STEP 1: Define binary RNA-seq DE indicators E_x(c)
+# # ==============================================================================
+
+# print("\n" + "="*80)
+# print("STEP 1: BINARY DE INDICATORS")
+# print("="*80)
+
+# tau_lfc = 1.0  # |logFC| threshold
+# tau_padj = 0.05
+
+# # E14 condition: positive logFC
+# deseq_results['E_E14'] = (
+#     (deseq_results['log2FoldChange'] > tau_lfc) & 
+#     (deseq_results['padj'] < tau_padj)
+# ).astype(int)
+
+# # E18 condition: negative logFC  
+# deseq_results['E_E18'] = (
+#     (deseq_results['log2FoldChange'] < -tau_lfc) & 
+#     (deseq_results['padj'] < tau_padj)
+# ).astype(int)
+
+# print(f"E14 DE genes: {deseq_results['E_E14'].sum()}")
+# print(f"E18 DE genes: {deseq_results['E_E18'].sum()}")
+
+# # Create lookup dictionaries
+# E_E14_dict = deseq_results.set_index('symbol')['E_E14'].to_dict()
+# E_E18_dict = deseq_results.set_index('symbol')['E_E18'].to_dict()
+
+
+# # ==============================================================================
+# # STEP 2: COMPUTE DA INDICATORS D_r(c) FOR EACH ELEMENT
+# # ==============================================================================
+# import pybedtools
+# print("\n" + "="*80)
+# print("STEP 2: BINARY DA INDICATORS PER ELEMENT")
+# print("="*80)
+
+# print(f"Merged regulatory elements: {len(merged_regulatory)}")
+# print(f"DA peaks: {len(dar_all)}")
+
+# # Overlap merged_regulatory with dar_all
+# reg_bed = pybedtools.BedTool.from_dataframe(
+#     merged_regulatory[['chr', 'start', 'end', 'gene', 'region_type']]
+# )
+
+# dar_bed = pybedtools.BedTool.from_dataframe(
+#     dar_all[['seqnames', 'start', 'end', 'Fold']].rename(columns={'seqnames': 'chr'})
+# )
+
+# reg_da_overlap = reg_bed.intersect(dar_bed, wa=True, wb=True)
+
+
+# print(f"Computing DA overlap...")
+
+# # Parse overlaps to get DA status per element
+# element_da_status = {}  # key: (chr, start, end, gene), value: Fold
+
+# for interval in tqdm(reg_da_overlap):
+#     element_key = (interval[0], int(interval[1]), int(interval[2]), interval[3])
+#     da_fold = float(interval[8])
+    
+#     # Keep the DA peak with max absolute fold change
+#     if element_key not in element_da_status:
+#         element_da_status[element_key] = da_fold
+#     else:
+#         if abs(da_fold) > abs(element_da_status[element_key]):
+#             element_da_status[element_key] = da_fold
+
+# print(f"Elements with DA overlap: {len(element_da_status)}")
+
+# # Add to merged_regulatory
+# merged_regulatory['element_key'] = list(zip(
+#     merged_regulatory['chr'],
+#     merged_regulatory['start'],
+#     merged_regulatory['end'],
+#     merged_regulatory['gene']
+# ))
+
+# merged_regulatory['da_fold'] = merged_regulatory['element_key'].map(
+#     lambda k: element_da_status.get(k, 0)
+# )
+
+# # Binary indicators: D_r(E14) = 1 if da_fold > 0, D_r(E18) = 1 if da_fold < 0
+# merged_regulatory['D_E14'] = (merged_regulatory['da_fold'] > 0).astype(int)
+# merged_regulatory['D_E18'] = (merged_regulatory['da_fold'] < 0).astype(int)
+
+# print(f"\nResults:")
+# print(f"  Elements with DA: {(merged_regulatory['da_fold'] != 0).sum()}")
+# print(f"  Elements with E14 DA (Fold > 0): {merged_regulatory['D_E14'].sum()}")
+# print(f"  Elements with E18 DA (Fold < 0): {merged_regulatory['D_E18'].sum()}")
+# print(f"\nSample:")
+# print(merged_regulatory[merged_regulatory['D_E14'] == 1][['chr', 'start', 'end', 'gene', 'region_type', 'da_fold', 'D_E14']].head())
+
+
+
+# # Load Cistrome metadata
+# cistrome_meta_path = '/mnt/lscratch/users/adhal/SingleCellUtils/data/pkn_data/mouse/CistromeDB_mm10_tranfac_version_3.0/mm10_tranfac_QC.txt'
+# cistrome_meta = pd.read_csv(cistrome_meta_path, sep='\t')
+
+# # Load ReMap (BED format: chr, start, end, name, score, strand, ...)
+# remap_path = '/mnt/lscratch/users/adhal/CorticalNeuronFate/CellConversionNSC/data/chip_seq/remap2022_nr_macs2_mm39_v1_0.bed'
+# remap_peaks = pd.read_csv(remap_path, sep='\t', header=None,
+#                           names=['chr', 'start', 'end', 'name', 'score', 'strand',
+#                                 'thick_start', 'thick_end', 'color'])
+
+# # Extract TF name from 'name' column (format: TF:celltype)
+# remap_peaks['TF'] = remap_peaks['name'].str.split(':').str[0]
+
+# print(f"ReMap peaks loaded: {len(remap_peaks):,}")
+# print(f"Unique TFs in ReMap: {remap_peaks['TF'].nunique()}")
+
+# print("\nSample TFs:")
+# print(remap_peaks['TF'].value_counts().head(10))
+
+# remap_bed = pybedtools.BedTool.from_dataframe(
+#     remap_peaks[['chr', 'start', 'end', 'TF']]
+# )
+
+# # Create a unique element key
+# merged_regulatory['element_key'] = (
+#     merged_regulatory['chr'].astype(str) + ':' +
+#     merged_regulatory['start'].astype(str) + '-' +
+#     merged_regulatory['end'].astype(str)
+# )
+
+# regulatory_bed = pybedtools.BedTool.from_dataframe(
+#     merged_regulatory[['chr', 'start', 'end', 'element_key']]
+# )
+
+# print("\n" + "="*80)
+# print("STEP 3: TF–ELEMENT BINDING B_{t,r} (ReMap only)")
+# print("="*80)
+
+# # Intersect ReMap peaks with regulatory elements
+# chip_overlap = remap_bed.intersect(
+#     regulatory_bed,
+#     wa=True,  # TF peak columns
+#     wb=True   # element columns
+# )
+
+# # Convert to DataFrame with canonical column names
+# chip_overlap_df = chip_overlap.to_dataframe(
+#     names=[
+#         'chr_tf', 'start_tf', 'end_tf', 'TF',
+#         'chr_el', 'start_el', 'end_el', 'element_key'
+#     ]
+# )
+
+# # Canonicalize TF names
+# chip_overlap_df['TF'] = chip_overlap_df['TF'].str.upper()
+
+# # B_{t,r} = 1 if ANY overlap exists
+# B_tr = (
+#     chip_overlap_df
+#     .drop_duplicates(subset=['TF', 'element_key'])
+#     .assign(B_tr=1)
+# )
+
+# print(f"TF–element pairs with ReMap binding: {len(B_tr):,}")
+# print(f"Unique TFs with binding: {B_tr['TF'].nunique():,}")
+# print(f"Unique regulatory elements bound: {B_tr['element_key'].nunique():,}")
+
+# TF_target_df = pd.read_csv('/mnt/lscratch/users/adhal/CorticalNeuronFate/CellConversionNSC/data/chip_seq/mouse_all_chip.csv')
+
+
+# ## Can we overlap DE TFs and DE genes here and seen which ones we geT?
+# e14_cond = (deseq_results['padj'] < 0.05) & (deseq_results['log2FoldChange'] > 1.00)
+# e18_cond = (deseq_results['padj'] < 0.05)& (deseq_results['log2FoldChange'] < -1.00)
+# de_e14_tfs = deseq_results[e14_cond & deseq_results['is_TF']]['symbol'].to_numpy()
+# de_e18_tfs = deseq_results[e18_cond & deseq_results['is_TF']]['symbol'].to_numpy()
+
+# de_e14_genes =deseq_results[e14_cond & ~deseq_results['is_TF']]['symbol'].to_numpy()
+# de_e18_genes =deseq_results[e18_cond & ~deseq_results['is_TF']]['symbol'].to_numpy()
+
+# ## TFs with binding evidence 
+# e14_chip_df = chip_overlap_df[chip_overlap_df['TF'].isin([i.upper() for i in de_e14_tfs])].reset_index(drop=True)
+# e18_chip_df = chip_overlap_df[chip_overlap_df['TF'].isin([i.upper() for i in de_e18_tfs])].reset_index(drop=True)
+
+# ## DA regions with DE genes
+# e14_DA_de_df = merged_regulatory[merged_regulatory['gene'].isin(de_e14_genes)].reset_index(drop=True)
+# e18_DA_de_df = merged_regulatory[merged_regulatory['gene'].isin(de_e18_genes)].reset_index(drop=True)
+
+# e14_tf_target_de_da = pd.merge(e14_chip_df, e14_DA_de_df[e14_DA_de_df['D_E14'] == 1].reset_index(drop=True), left_on='element_key', right_on='element_key')
+# e18_tf_target_de_da = pd.merge(e18_chip_df, e18_DA_de_df[e18_DA_de_df['D_E18'] == 1].reset_index(drop=True), left_on='element_key', right_on='element_key')
+
+# grn_e18 = e18_tf_target_de_da[['TF', 'gene']]
+# grn_e14 = e14_tf_target_de_da[['TF', 'gene']]
+
+
+# TF_target_df_sub_e14 = TF_target_df[(TF_target_df['TF'].isin(grn_e14['TF'])) & (TF_target_df['Target'].isin(grn_e14['TF']))].reset_index(drop=True)
+# grn_e14_for_merge = grn_e14.copy()
+# grn_e14_for_merge['gene'] = grn_e14_for_merge['gene'].str.upper()
+# grn_e14_for_merge.columns = ['TF', 'Target']
+# new_full_net_e14 = pd.concat([TF_target_df_sub_e14[['TF', 'Target']], grn_e14_for_merge.reset_index(drop=True)], axis=0).drop_duplicates()
+# new_full_net_e14 = new_full_net_e14[new_full_net_e14['TF'] != new_full_net_e14['Target']].reset_index(drop=True)
+# new_full_net_e14.columns = ['TF', 'gene']
+
+# TF_target_df_sub_e18 = TF_target_df[(TF_target_df['TF'].isin(grn_e18['TF'])) & (TF_target_df['Target'].isin(grn_e18['TF']))].reset_index(drop=True)
+# grn_e18_for_merge = grn_e18.copy()
+# grn_e18_for_merge['gene'] = grn_e18_for_merge['gene'].str.upper()
+# grn_e18_for_merge.columns = ['TF', 'Target']
+# new_full_net_e18 = pd.concat([TF_target_df_sub_e18[['TF', 'Target']], grn_e18_for_merge.reset_index(drop=True)], axis=0).drop_duplicates()
+# new_full_net_e18 = new_full_net_e18[new_full_net_e18['TF'] != new_full_net_e18['Target']].reset_index(drop=True)
+# new_full_net_e18.columns = ['TF', 'gene']

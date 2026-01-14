@@ -15,7 +15,7 @@ from src.bulk_gjsd import BulkGJSD
 import pybedtools
 from scipy import stats
 from statsmodels.stats.multitest import multipletests
-
+import pyranges as pr
 class NSCAnalysis:
     """
     Analysis pipeline for NSC cell conversion project.
@@ -26,6 +26,9 @@ class NSCAnalysis:
 
     Enhanced with loading of the Chip seq bed files
     """
+###############################################################################################################
+############################### INPUT DATA LOADING IS HERE ####################################################
+###############################################################################################################  
     def __init__(
         self,
         counts_path: str,
@@ -208,11 +211,70 @@ class NSCAnalysis:
         print("\n" + "=" * 60)
         print("All data loaded successfully!")
         print("=" * 60)
-    
-        
 
+###############################################################################################################
+############################### ALL LOADING AND REGULATORY REGION CREATION HERE ###############################
+###############################################################################################################  
+
+######## Defining our regulatory regions to be used in Base GRN #########
+######## 2 steps
+######## 1. Load GTF file and enhancer atlas (downloaded)
+######## 2. annotate them into promoters, enhancers and proximal promoters 
+######## NOTE: Many enhancers could be promoters for different genes 
+######## Proximal promoters are defined as those with enhancer and promoter overlap for the same Gene only. 
+######## Finallly we would get a dataframe of
+# 'chr': prom['chr'],
+# 'start': prom['start'],
+# 'end': prom['end'],
+# 'gene': prom['gene'],
+# 'region_type': 'promoter'
+##############################################################################################################
+    def _parse_gtf_gene_mapping(self) -> Dict[str, str]:
+        """Parse GTF file to create Ensembl ID -> Gene Symbol mapping."""
+        print("      Parsing GTF for gene mappings...")
+        
+        ensembl_to_symbol = {}
+        
+        with open(self.paths['gtf'], 'r') as f:
+            for line in f:
+                if line.startswith('#'):
+                    continue
+                
+                fields = line.strip().split('\t')
+                if len(fields) < 9:
+                    continue
+                
+                # Only parse gene entries
+                if fields[2] != 'gene':
+                    continue
+                
+                attributes = fields[8]
+                
+                # Extract gene_id and gene_name
+                gene_id = None
+                gene_name = None
+                
+                for attr in attributes.split(';'):
+                    attr = attr.strip()
+                    if attr.startswith('gene_id'):
+                        # gene_id "ENSMUSG00000000001.5"
+                        gene_id = attr.split('"')[1].split('.')[0]  # Remove version
+                    elif attr.startswith('gene_name'):
+                        # gene_name "Gnai3"
+                        gene_name = attr.split('"')[1]
+                
+                if gene_id and gene_name:
+                    ensembl_to_symbol[gene_id] = gene_name
+        
+        print(f"      Parsed {len(ensembl_to_symbol)} gene mappings from GTF")
+        return ensembl_to_symbol
+    
     def _get_promoters_from_gtf(self, window=2000):
-        """Extract promoter regions (TSS ± window) from GTF."""
+        """
+        Extract promoter regions (UPSTREAM of TSS) from GTF.
+        
+        Promoter = window bp UPSTREAM of TSS
+        """
         promoters = []
         
         with open(self.paths['gtf']) as f:
@@ -240,23 +302,143 @@ class NSCAnalysis:
                 
                 gene_name = attrs.get('gene_name', '')
                 
-                # Get TSS based on strand
+                # Get TSS and promoter based on strand
                 if strand == '+':
                     tss = start
-                else:
+                    # Promoter is UPSTREAM (before gene start)
+                    promoter_start = max(0, tss - window)
+                    promoter_end = tss
+                else:  # - strand
                     tss = end
+                    # Promoter is UPSTREAM (after gene end in coordinates)
+                    promoter_start = tss
+                    promoter_end = tss + window
                 
-                # Promoter = TSS ± window
                 promoters.append({
                     'chr': chrom,
-                    'start': max(0, tss - window),
-                    'end': tss + window,
+                    'start': promoter_start,
+                    'end': promoter_end,
                     'gene': gene_name,
-                    'strand': strand
+                    'strand': strand,
+                    'tss': tss
                 })
         
         return pd.DataFrame(promoters)
-    
+##############################################################################################################
+##############################################################################################################
+    def create_merged_regulatory_regions(self, promoters, enhancers):
+        """
+        Merge promoters and enhancers into unified regulatory regions.
+        
+        SIMPLE LOGIC:
+        1. Same-gene overlap → Merge into "proximal_regulatory"
+        2. Everything else → Keep as-is ("promoter" or "enhancer")
+        
+        Different-gene overlaps are FINE - both regions stay separate.
+        """
+        print("\n" + "="*80)
+        print("CREATING MERGED REGULATORY REGIONS")
+        print("="*80)
+        
+        print(f"Input:")
+        print(f"  Promoters: {len(promoters):,}")
+        print(f"  Enhancers: {len(enhancers):,}")
+        
+        # Convert to PyRanges
+        promoters_pr = pr.PyRanges(promoters.rename(
+            columns={'chr': 'Chromosome', 'start': 'Start', 'end': 'End'}
+        ))
+        
+        enhancers_pr = pr.PyRanges(enhancers.rename(
+            columns={'chr': 'Chromosome', 'start': 'Start', 'end': 'End', 'symbol': 'gene'}
+        ))
+        
+        # Find overlaps
+        all_overlaps = promoters_pr.join(enhancers_pr).df
+        
+        # Get SAME-GENE overlaps
+        same_gene_overlaps = all_overlaps[
+            all_overlaps['gene'] == all_overlaps['gene_b']
+        ].copy()
+        
+        print(f"\nSame-gene promoter-enhancer overlaps: {len(same_gene_overlaps):,}")
+        
+        # Track which promoters/enhancers are in same-gene overlaps
+        promoters_in_proximal = set(
+            zip(same_gene_overlaps['gene'], 
+                same_gene_overlaps['Chromosome'],
+                same_gene_overlaps['Start'], 
+                same_gene_overlaps['End'])
+        )
+        
+        enhancers_in_proximal = set(
+            zip(same_gene_overlaps['gene_b'],
+                same_gene_overlaps['Chromosome'],
+                same_gene_overlaps['Start_b'], 
+                same_gene_overlaps['End_b'])
+        )
+        
+        # 1. Create proximal regulatory regions (merge same-gene overlaps)
+        proximal_regions = []
+        for _, row in same_gene_overlaps.iterrows():
+            merged_start = min(row['Start'], row['Start_b'])
+            merged_end = max(row['End'], row['End_b'])
+            
+            proximal_regions.append({
+                'chr': row['Chromosome'],
+                'start': merged_start,
+                'end': merged_end,
+                'gene': row['gene'],
+                'region_type': 'proximal_regulatory'
+            })
+        
+        proximal_df = pd.DataFrame(proximal_regions).drop_duplicates()
+        
+        # 2. Keep promoters that DON'T have same-gene overlap
+        promoter_regions = []
+        for _, prom in promoters.iterrows():
+            prom_key = (prom['gene'], prom['chr'], prom['start'], prom['end'])
+            if prom_key not in promoters_in_proximal:
+                promoter_regions.append({
+                    'chr': prom['chr'],
+                    'start': prom['start'],
+                    'end': prom['end'],
+                    'gene': prom['gene'],
+                    'region_type': 'promoter'
+                })
+        
+        promoter_df = pd.DataFrame(promoter_regions)
+        
+        # 3. Keep enhancers that DON'T have same-gene overlap
+        enhancer_regions = []
+        for _, enh in enhancers.iterrows():
+            enh_key = (enh['symbol'], enh['chr'], enh['start'], enh['end'])
+            if enh_key not in enhancers_in_proximal:
+                enhancer_regions.append({
+                    'chr': enh['chr'],
+                    'start': enh['start'],
+                    'end': enh['end'],
+                    'gene': enh['symbol'],
+                    'region_type': 'enhancer'
+                })
+        
+        enhancer_df = pd.DataFrame(enhancer_regions)
+        
+        # Combine
+        merged_regulatory = pd.concat([
+            promoter_df,
+            proximal_df,
+            enhancer_df
+        ], ignore_index=True)
+        
+        print(f"\nOutput:")
+        print(f"  Promoter: {len(promoter_df):,}")
+        print(f"  Proximal regulatory: {len(proximal_df):,}")
+        print(f"  Enhancer: {len(enhancer_df):,}")
+        print(f"  Total: {len(merged_regulatory):,}")
+        
+        return merged_regulatory
+
     def _load_chip_peaks(self):
         """Load ChIP-seq peaks from BED file."""
         # Read file, skip track line
@@ -272,7 +454,9 @@ class NSCAnalysis:
         chip_peaks = chip_peaks[['chr', 'start', 'end', 'TF', 'score']].copy()
         
         return chip_peaks
-    
+###############################################################################################################
+############################### RNA-SEQ DATA NORMALIZATION METHODS ARE HERE ###################################
+###############################################################################################################   
     def _filter_low_counts(
         self,
         min_counts: int = 10,
@@ -431,46 +615,6 @@ class NSCAnalysis:
         print(f"ATAC peaks: {self.atac_annotated.shape[0]}")
         print(f"TF list: {len(self.tf_symbols)} TFs")
 
-    def _parse_gtf_gene_mapping(self) -> Dict[str, str]:
-        """Parse GTF file to create Ensembl ID -> Gene Symbol mapping."""
-        print("      Parsing GTF for gene mappings...")
-        
-        ensembl_to_symbol = {}
-        
-        with open(self.paths['gtf'], 'r') as f:
-            for line in f:
-                if line.startswith('#'):
-                    continue
-                
-                fields = line.strip().split('\t')
-                if len(fields) < 9:
-                    continue
-                
-                # Only parse gene entries
-                if fields[2] != 'gene':
-                    continue
-                
-                attributes = fields[8]
-                
-                # Extract gene_id and gene_name
-                gene_id = None
-                gene_name = None
-                
-                for attr in attributes.split(';'):
-                    attr = attr.strip()
-                    if attr.startswith('gene_id'):
-                        # gene_id "ENSMUSG00000000001.5"
-                        gene_id = attr.split('"')[1].split('.')[0]  # Remove version
-                    elif attr.startswith('gene_name'):
-                        # gene_name "Gnai3"
-                        gene_name = attr.split('"')[1]
-                
-                if gene_id and gene_name:
-                    ensembl_to_symbol[gene_id] = gene_name
-        
-        print(f"      Parsed {len(ensembl_to_symbol)} gene mappings from GTF")
-        return ensembl_to_symbol
-    
     @staticmethod
     def calculate_tpm(
         counts: pd.DataFrame,
@@ -616,9 +760,10 @@ class NSCAnalysis:
         print(f"Length range: {lengths.min()} - {lengths.max()} bp")
         
         return lengths
-# ==============================================================================
-# NSCAnalysis Class - Step 2: Add DESeq2 method
-# ==============================================================================
+
+###############################################################################################################
+############################### RNA-SEQ DATA ANALYSIS METHODS ARE HERE ########################################
+###############################################################################################################  
     def run_deseq(
         self, 
         group1: str, 
@@ -1143,10 +1288,10 @@ class NSCAnalysis:
             f'specific_{name1}': specific1,
             f'specific_{name2}': specific2
         }
-# ==============================================================================
-# NSCAnalysis Class - Step 3: Add gJSD method
 
-    # Add this method to NSCAnalysis class:
+###############################################################################################################
+############################### OLD BULK GJSD METHODS ARE HERE ################################################
+###############################################################################################################  
 
     def run_gjsd(
         self,
@@ -1349,10 +1494,9 @@ class NSCAnalysis:
             f'{group2}_specific': g2_df
         }
 
-    # ============================================================================
-    # DIFFERENTIAL ATAC-SEQ ANALYSIS
-    # ============================================================================
-
+###############################################################################################################################################################
+############################### OLD CONSENSUS PEAKS AND DA USING NARRO PEAKS ARE HERE (REDUNDANT)- NEED TO REMOVE #############################################
+############################################################################################################################################################### 
     def _create_consensus_peaks(
         self,
         merge_distance: int = 10
