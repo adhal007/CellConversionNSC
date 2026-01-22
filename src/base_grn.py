@@ -418,8 +418,7 @@ class GRNBuilder:
         print(f"  {e14_path}")
         print(f"  {e18_path}")
     
-    def create_atac_signal_matrix(self, e14_peak_files, e18_peak_files, 
-                                e14_sample_ids, e18_sample_ids, n_cores=8):
+    def create_atac_signal_matrix(self, all_files):
         """
         Create signal matrix: regulatory elements x samples (parallelized).
         
@@ -433,36 +432,13 @@ class GRNBuilder:
         Returns:
             signal_matrix: DataFrame with elements as rows, samples as columns
         """
-        from multiprocessing import Pool
-        import pybedtools
-        
-        print("\n" + "="*80)
-        print("CREATING ATAC SIGNAL MATRIX (PARALLELIZED)")
-        print("="*80)
-        
-        # Get all sample IDs and files
-        all_samples = e14_sample_ids + e18_sample_ids
-        all_peak_files = e14_peak_files + e18_peak_files
-        
-        print(f"Total samples: {len(all_samples)}")
-        print(f"  E14: {len(e14_sample_ids)}")
-        print(f"  E18: {len(e18_sample_ids)}")
-        print(f"Using {n_cores} cores")
-        
-        # Get all element keys
-        all_elements = self.merged_regulatory['element_key'].tolist()
-        print(f"Total regulatory elements: {len(all_elements)}")
-        
-        # Define worker function
-        def process_sample(args):
-            """Process one sample and return element:signal mapping."""
-            peak_file, sample_id, reg_df = args
-            
-            # Load narrowPeak
-            peaks = pd.read_csv(peak_file, sep='\t', header=None,
+        signal_matrix = []
+        for PEAK_FILE in all_files:
+            peaks = pd.read_csv(PEAK_FILE, sep='\t', header=None,
                             names=['chr', 'start', 'end', 'name', 'score', 
                                     'strand', 'signalValue', 'pValue', 'qValue', 'peak'])
-            
+            sample_id = PEAK_FILE.split('/')[-1].split('_')[0]
+            reg_df = self.merged_regulatory
             # Overlap
             peaks_bed = pybedtools.BedTool.from_dataframe(peaks[['chr', 'start', 'end', 'signalValue']])
             reg_bed = pybedtools.BedTool.from_dataframe(reg_df[['chr', 'start', 'end', 'element_key']])
@@ -475,77 +451,81 @@ class GRNBuilder:
                 signal = float(interval[3])
                 element_key = interval[7]
                 sample_signals[element_key] = signal
+
             
-            return sample_id, sample_signals
-        
-        # Prepare arguments for parallel processing
-        args_list = [(peak_file, sample_id, self.merged_regulatory) 
-                    for peak_file, sample_id in zip(all_peak_files, all_samples)]
-        
-        # Process in parallel
-        print(f"\nProcessing {len(args_list)} samples in parallel...")
-        with Pool(n_cores) as pool:
-            results = pool.map(process_sample, args_list)
-        
-        # Initialize matrix
-        signal_matrix = pd.DataFrame(0.0, index=all_elements, columns=all_samples)
-        
-        # Fill matrix from results
-        print("Filling matrix from parallel results...")
-        for sample_id, sample_signals in results:
-            for element_key, signal in sample_signals.items():
-                signal_matrix.loc[element_key, sample_id] = signal
-        
-        # Store in class
-        self.signal_matrix = signal_matrix
-        self.e14_sample_ids = e14_sample_ids
-        self.e18_sample_ids = e18_sample_ids
-        
-        # Print statistics
-        print("\n" + "="*80)
-        print("SIGNAL MATRIX STATISTICS")
-        print("="*80)
-        
-        n_zeros = (signal_matrix == 0).sum().sum()
-        n_total = signal_matrix.size
-        sparsity = 100 * n_zeros / n_total
-        
-        print(f"\nSparsity: {sparsity:.2f}% zeros")
-        print(f"Non-zero entries: {n_total - n_zeros:,} / {n_total:,}")
-        
-        non_zero_signals = signal_matrix.values[signal_matrix.values > 0]
-        print(f"\nNon-zero signal distribution:")
-        print(pd.Series(non_zero_signals).describe())
-        
-        sample_coverage = (signal_matrix > 0).sum(axis=0)
-        print(f"\nPer-sample element coverage:")
-        print(sample_coverage.describe())
-        
-        element_coverage = (signal_matrix > 0).sum(axis=1)
-        print(f"\nPer-element sample coverage:")
-        print(element_coverage.describe())
-        
-        return signal_matrix
+            sample_signal_df = pd.DataFrame(pd.Series(sample_signals)).reset_index()
+            sample_signal_df.columns = ['element_key', 'signal_value']
+            sample_signal_df['sample_id'] = sample_id
+            element_keys_not_in_sample = reg_df[~reg_df['element_key'].isin(sample_signal_df)]['element_key'].tolist()
+            
+            # Create dataframe for missing elements with 0 signal
+            missing_df = pd.DataFrame({
+                'element_key': element_keys_not_in_sample,
+                'signal_value': 0.0,
+                'sample_id': sample_id
+            })
+            
+            # Concatenate with existing signals
+            sample_signal_df_complete = pd.concat([sample_signal_df, missing_df], ignore_index=True)
+            
+            # print(f"Original: {len(sample_signal_df)} elements with signal")
+            # print(f"Missing: {len(missing_df)} elements with no signal")
+            # print(f"Complete: {len(sample_signal_df_complete)} total elements")
+            
+            # Aggregate duplicates by taking the maximum signal per element per sample
+            sample_signal_df_agg = sample_signal_df_complete.groupby(
+                ['sample_id', 'element_key'], 
+                as_index=False
+            )['signal_value'].max()
+            
+            # Now pivot
+            wide_df = sample_signal_df_agg.pivot(
+                index='sample_id', 
+                columns='element_key', 
+                values='signal_value'
+            )
+            signal_matrix.append(wide_df)
+            signal_matrix_df = pd.concat(signal_matrix)
+            return signal_matrix_df
     
-    def compute_element_zscores_parallel(self, e14_peak_files, e18_peak_files, 
-                                        e14_sample_ids, e18_sample_ids, n_cores=8):
-        """Compute Z-scores for regulatory elements across conditions (parallelized)."""
+    def compute_element_zscores_parallel(self, 
+                                        all_e14_peak_files, all_e18_peak_files,  # Global distribution
+                                        cd133_e14_peak_files, cd133_e18_peak_files,  # CD133 Ctx only
+                                        e14_sample_ids, e18_sample_ids, 
+                                        n_cores=8):
+        """
+        Compute Z-scores for regulatory elements across conditions (parallelized).
+        
+        Args:
+            all_e14_peak_files: ALL E14 narrowPeak files (for global distribution)
+            all_e18_peak_files: ALL E18 narrowPeak files (for global distribution)
+            cd133_e14_peak_files: CD133 Ctx E14 narrowPeak files (for Z-score calculation)
+            cd133_e18_peak_files: CD133 Ctx E18 narrowPeak files (for Z-score calculation)
+            e14_sample_ids: CD133 Ctx E14 sample IDs
+            e18_sample_ids: CD133 Ctx E18 sample IDs
+            n_cores: Number of cores for parallel processing
+        """
         from multiprocessing import Pool
         
         print("\n" + "="*80)
         print("COMPUTING ELEMENT Z-SCORES (PARALLELIZED)")
         print("="*80)
         
-        all_peak_files = e14_peak_files + e18_peak_files
+        # Use ALL samples for global distribution
+        all_peak_files = all_e14_peak_files + all_e18_peak_files
+        cd133_peak_files = cd133_e14_peak_files + cd133_e18_peak_files
         
-        print(f"Total peak files: {len(all_peak_files)}")
+        print(f"Global distribution files: {len(all_peak_files)}")
+        print(f"  E14: {len(all_e14_peak_files)}, E18: {len(all_e18_peak_files)}")
+        print(f"CD133 Ctx files: {len(cd133_peak_files)}")
+        print(f"  E14: {len(cd133_e14_peak_files)}, E18: {len(cd133_e18_peak_files)}")
         print(f"Using {n_cores} cores")
         
         # Extract only necessary columns as plain DataFrame
         reg_df = self.merged_regulatory[['chr', 'start', 'end', 'element_key']].copy()
         
-        # Step 1: Build signal distribution
-        print("\nStep 1: Building signal distribution per element...")
+        # Step 1: Build signal distribution from ALL samples
+        print("\nStep 1: Building signal distribution per element (ALL samples)...")
         args_list = [(peak_file, reg_df) for peak_file in all_peak_files]
         
         with Pool(n_cores) as pool:
@@ -574,41 +554,38 @@ class GRNBuilder:
         element_stats_df = pd.DataFrame(element_stats)
         print(f"\nElement statistics computed")
 
-        # After creating element_stats_df, convert to dict
+        # Convert to dict for fast lookup
         element_stats_dict = {
             row['element_key']: {'mean': row['mean_signal'], 'sd': row['sd_signal']}
             for _, row in element_stats_df.iterrows()
         }
 
-        # Step 2: Calculate Z-scores for ALL samples in parallel (CHANGED)
-        print("\nStep 2: Calculating Z-scores per sample...")
-        # args_list = [(peak_file, element_stats_df, reg_df) for peak_file in all_peak_files]
-
-        # Pass dict instead of DataFrame
-        args_list = [(peak_file, element_stats_dict, reg_df) for peak_file in all_peak_files]
+        # Step 2: Calculate Z-scores ONLY for CD133 Ctx samples
+        print("\nStep 2: Calculating Z-scores for CD133 Ctx samples...")
+        args_list = [(peak_file, element_stats_dict, reg_df) for peak_file in cd133_peak_files]
         
         with Pool(n_cores) as pool:
             all_sample_zscores = pool.map(_calculate_zscores_for_sample, args_list)
         
-        # Aggregate by condition (CHANGED)
+        # Aggregate by condition
         e14_zscores = {}
         e18_zscores = {}
         
         for i, sample_zscores in enumerate(all_sample_zscores):
-            if i < len(e14_peak_files):
-                # E14 sample
+            if i < len(cd133_e14_peak_files):
+                # E14 CD133 Ctx sample
                 for element_key, zscores in sample_zscores.items():
                     if element_key not in e14_zscores:
                         e14_zscores[element_key] = []
                     e14_zscores[element_key].extend(zscores)
             else:
-                # E18 sample
+                # E18 CD133 Ctx sample
                 for element_key, zscores in sample_zscores.items():
                     if element_key not in e18_zscores:
                         e18_zscores[element_key] = []
                     e18_zscores[element_key].extend(zscores)
         
-        # Sum Z-scores per condition (CHANGED)
+        # Sum Z-scores per condition
         e14_sum = {k: np.sum(v) for k, v in e14_zscores.items()}
         e18_sum = {k: np.sum(v) for k, v in e18_zscores.items()}
         
@@ -621,12 +598,36 @@ class GRNBuilder:
         print(f"  E18 elements with signal: {(self.merged_regulatory['zscore_E18'] != 0).sum()}")
         
         return self.merged_regulatory
-        
+    
+# Define worker function
+def _process_sample(args):
+    """Process one sample and return element:signal mapping."""
+    peak_file, sample_id, reg_df = args
+    
+    # Load narrowPeak
+    peaks = pd.read_csv(peak_file, sep='\t', header=None,
+                    names=['chr', 'start', 'end', 'name', 'score', 
+                            'strand', 'signalValue', 'pValue', 'qValue', 'peak'])
+    
+    # Overlap
+    peaks_bed = pybedtools.BedTool.from_dataframe(peaks[['chr', 'start', 'end', 'signalValue']])
+    reg_bed = pybedtools.BedTool.from_dataframe(reg_df[['chr', 'start', 'end', 'element_key']])
+    
+    overlap = peaks_bed.intersect(reg_bed, wa=True, wb=True)
+    
+    # Collect signals for this sample
+    sample_signals = {}
+    for interval in overlap:
+        signal = float(interval[3])
+        element_key = interval[7]
+        sample_signals[element_key] = signal
+    
+    return sample_id, sample_signals
+
 # ==============================================================================
-# HELPER FUNCTIONS FOR PARALLEL Z-SCORE COMPUTATION (OUTSIDE CLASS)
+# HELPER FUNCTIONS (NO CHANGES)
 # ==============================================================================
 
-# Helper function processes ONE sample (no loop)
 def _process_sample_for_distribution(args):
     """Process ONE sample."""
     import pandas as pd
@@ -635,8 +636,8 @@ def _process_sample_for_distribution(args):
     peak_file, reg_data = args
     
     peaks = pd.read_csv(peak_file, sep='\t', header=None,
-                       names=['chr', 'start', 'end', 'name', 'score', 
-                             'strand', 'signalValue', 'pValue', 'qValue', 'peak'])
+                    names=['chr', 'start', 'end', 'name', 'score', 
+                            'strand', 'signalValue', 'pValue', 'qValue', 'peak'])
     
     peaks_bed = pybedtools.BedTool.from_dataframe(peaks[['chr', 'start', 'end', 'signalValue']])
     reg_bed = pybedtools.BedTool.from_dataframe(reg_data)
@@ -654,18 +655,17 @@ def _process_sample_for_distribution(args):
     return sample_signals
 
 
-# For Step 2, we need to process each SAMPLE separately, not each condition
 def _calculate_zscores_for_sample(args):
     """Calculate Z-scores for ONE sample."""
     import pandas as pd
     import numpy as np
     import pybedtools
     
-    peak_file, element_stats_dict, reg_data = args  # Changed to dict
+    peak_file, element_stats_dict, reg_data = args
     
     peaks = pd.read_csv(peak_file, sep='\t', header=None,
-                       names=['chr', 'start', 'end', 'name', 'score', 
-                             'strand', 'signalValue', 'pValue', 'qValue', 'peak'])
+                    names=['chr', 'start', 'end', 'name', 'score', 
+                            'strand', 'signalValue', 'pValue', 'qValue', 'peak'])
     
     peaks_bed = pybedtools.BedTool.from_dataframe(peaks[['chr', 'start', 'end', 'signalValue']])
     reg_bed = pybedtools.BedTool.from_dataframe(reg_data)
@@ -678,7 +678,6 @@ def _calculate_zscores_for_sample(args):
         signal = float(interval[3])
         element_key = interval[7]
         
-        # O(1) lookup instead of DataFrame filtering
         if element_key in element_stats_dict:
             mean_sig = element_stats_dict[element_key]['mean']
             sd_sig = element_stats_dict[element_key]['sd']
