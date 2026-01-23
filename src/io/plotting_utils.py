@@ -8,6 +8,8 @@ from matplotlib.colors import LinearSegmentedColormap
 import matplotlib.pyplot as plt
 import seaborn as sns
 from matplotlib.patches import Patch
+import networkx as nx
+import numpy as np
 
 def get_comparison_tfs(result, top_n=500, padj_thresh=0.05, lfc_thresh=1.0, verbose=True):
     """
@@ -737,3 +739,234 @@ def plot_tf_filtering_summary(
     plt.rcParams.update(plt.rcParamsDefault)
     
     return summary
+
+"""
+Prettier TF-TF Network Visualization
+Shows: Master Regulators → SCC → Downstream TFs
+"""
+
+def plot_tf_network_pretty(G, scc_nodes, top_masters, title="TF-TF Network", 
+                           figsize=(18, 12)):
+    """
+    Create beautiful TF-TF network plot with clear hierarchy.
+    
+    Args:
+        G: NetworkX DiGraph
+        scc_nodes: Set of nodes in the SCC
+        top_masters: List of master regulator TFs
+        title: Plot title
+    """
+    # Identify node categories
+    masters = set(top_masters)
+    scc = set(scc_nodes)
+    
+    # Get all descendants of SCC
+    downstream = set()
+    for scc_node in scc:
+        downstream |= nx.descendants(G, scc_node)
+    downstream = downstream - scc  # Remove SCC nodes themselves
+    
+    # Intermediate nodes (between masters and SCC)
+    intermediate = set()
+    for master in masters:
+        master_descendants = nx.descendants(G, master)
+        intermediate |= (master_descendants & scc)  # Nodes that connect masters to SCC
+    
+    # Create hierarchical layout
+    pos = {}
+    
+    # Level 0: Master regulators (top)
+    masters_list = list(masters)
+    y_masters = 3.0
+    for i, node in enumerate(masters_list):
+        x = (i - len(masters_list)/2) * 1.5
+        pos[node] = (x, y_masters)
+    
+    # Level 1: SCC (middle) - use circular layout for SCC
+    scc_list = list(scc)
+    if len(scc_list) > 0:
+        # Circular layout for SCC
+        angle_step = 2 * np.pi / len(scc_list)
+        radius = 1.0
+        y_scc = 1.5
+        for i, node in enumerate(scc_list):
+            angle = i * angle_step
+            x = radius * np.cos(angle)
+            y = y_scc + radius * np.sin(angle)
+            pos[node] = (x, y)
+    
+    # Level 2: Downstream (bottom)
+    downstream_list = list(downstream)
+    if len(downstream_list) > 0:
+        y_downstream = 0.0
+        # Spread downstream nodes
+        for i, node in enumerate(downstream_list):
+            x = (i - len(downstream_list)/2) * 0.8
+            pos[node] = (x, y_downstream)
+    
+    # Handle any remaining nodes (shouldn't happen but just in case)
+    remaining = set(G.nodes()) - masters - scc - downstream
+    if remaining:
+        for i, node in enumerate(remaining):
+            pos[node] = (i - len(remaining)/2, -1.0)
+    
+    # Node colors and sizes
+    node_colors = []
+    node_sizes = []
+    for node in G.nodes():
+        if node in masters:
+            node_colors.append('#e74c3c')  # Red for masters
+            node_sizes.append(2000)
+        elif node in scc:
+            node_colors.append('#9b59b6')  # Purple for SCC
+            node_sizes.append(1800)
+        elif node in downstream:
+            node_colors.append('#3498db')  # Blue for downstream
+            node_sizes.append(1400)
+        else:
+            node_colors.append('#95a5a6')  # Gray for others
+            node_sizes.append(1200)
+    
+    # Edge colors
+    edge_colors = []
+    edge_widths = []
+    for u, v in G.edges():
+        if u in scc and v in scc:
+            edge_colors.append('#9b59b6')  # Purple for SCC internal edges
+            edge_widths.append(3.0)
+        elif u in masters:
+            edge_colors.append('#e74c3c')  # Red from masters
+            edge_widths.append(2.5)
+        else:
+            edge_colors.append('#34495e')  # Dark gray for others
+            edge_widths.append(1.5)
+    
+    # Plot
+    fig, ax = plt.subplots(figsize=figsize)
+    
+    # Draw edges
+    nx.draw_networkx_edges(G, pos, 
+                          edge_color=edge_colors,
+                          width=edge_widths,
+                          alpha=0.6,
+                          arrows=True,
+                          arrowsize=20,
+                          arrowstyle='->',
+                          connectionstyle='arc3,rad=0.1',
+                          ax=ax)
+    
+    # Draw nodes
+    nx.draw_networkx_nodes(G, pos,
+                          node_color=node_colors,
+                          node_size=node_sizes,
+                          alpha=0.9,
+                          ax=ax)
+    
+    # Draw labels
+    nx.draw_networkx_labels(G, pos,
+                           font_size=10,
+                           font_weight='bold',
+                           font_color='white',
+                           ax=ax)
+    
+    # Add legend
+    from matplotlib.patches import Patch
+    legend_elements = [
+        Patch(facecolor='#e74c3c', label=f'Master Regulators (n={len(masters)})'),
+        Patch(facecolor='#9b59b6', label=f'SCC - Feedback Loop (n={len(scc)})'),
+        Patch(facecolor='#3498db', label=f'Downstream TFs (n={len(downstream)})')
+    ]
+    ax.legend(handles=legend_elements, loc='upper left', fontsize=12, framealpha=0.9)
+    
+    # Add layer labels
+    ax.text(-8, y_masters, 'MASTER\nREGULATORS', 
+           fontsize=12, weight='bold', ha='center', va='center',
+           bbox=dict(boxstyle='round', facecolor='#e74c3c', alpha=0.3))
+    
+    if len(scc) > 0:
+        ax.text(-8, 1.5, 'FEEDBACK\nLOOP (SCC)', 
+               fontsize=12, weight='bold', ha='center', va='center',
+               bbox=dict(boxstyle='round', facecolor='#9b59b6', alpha=0.3))
+    
+    if len(downstream) > 0:
+        ax.text(-8, y_downstream, 'DOWNSTREAM\nTARGETS', 
+               fontsize=12, weight='bold', ha='center', va='center',
+               bbox=dict(boxstyle='round', facecolor='#3498db', alpha=0.3))
+    
+    ax.set_title(title, fontsize=16, weight='bold', pad=20)
+    ax.axis('off')
+    ax.set_xlim(-10, 10)
+    
+    plt.tight_layout()
+    
+    return fig
+
+
+def analyze_and_plot_tf_network(tf_tf_grn, top_k=5, title="TF-TF Network"):
+    """
+    Complete analysis and plotting pipeline.
+    
+    Args:
+        tf_tf_grn: DataFrame with columns ['TF', 'gene']
+        top_k: Number of top master regulators to show
+        title: Plot title
+    """
+    # Build graph
+    G = nx.DiGraph()
+    G.add_edges_from(tf_tf_grn[["TF", "gene"]].itertuples(index=False, name=None))
+    
+    print("=" * 80)
+    print("TF-TF NETWORK ANALYSIS")
+    print("=" * 80)
+    print(f"Total nodes: {G.number_of_nodes()}")
+    print(f"Total edges: {G.number_of_edges()}")
+    
+    # Find SCCs
+    sccs = list(nx.strongly_connected_components(G))
+    sccs_sorted = sorted(sccs, key=len, reverse=True)
+    largest_scc = sccs_sorted[0]
+    
+    print(f"\nStrongly Connected Components:")
+    print(f"  Total SCCs: {len(sccs)}")
+    print(f"  Largest SCC size: {len(largest_scc)}")
+    print(f"  Largest SCC nodes: {sorted(largest_scc)}")
+    
+    if len(sccs_sorted) > 1 and len(sccs_sorted[1]) > 1:
+        print(f"  2nd largest SCC size: {len(sccs_sorted[1])}")
+    
+    # Calculate centrality metrics
+    reachability = {n: len(nx.descendants(G, n)) for n in G.nodes()}
+    pagerank = nx.pagerank(G) if G.number_of_edges() > 0 else {n: 0 for n in G.nodes()}
+    
+    scores = pd.DataFrame({
+        "out_degree": dict(G.out_degree()),
+        "in_degree": dict(G.in_degree()),
+        "reachability": reachability,
+        "pagerank": pagerank
+    })
+    
+    # Top master regulators by reachability
+    top_masters = scores.sort_values("reachability", ascending=False).head(top_k).index.tolist()
+    
+    print(f"\nTop {top_k} Master Regulators (by reachability):")
+    for i, tf in enumerate(top_masters, 1):
+        reach = scores.loc[tf, 'reachability']
+        out_deg = scores.loc[tf, 'out_degree']
+        print(f"  {i}. {tf:15s} → reaches {reach:.0f} TFs ({out_deg:.0f} direct targets)")
+    
+    # Create subgraph: top masters + their descendants
+    nodes_to_plot = set(top_masters)
+    for tf in top_masters:
+        nodes_to_plot |= nx.descendants(G, tf)
+    
+    H = G.subgraph(nodes_to_plot).copy()
+    
+    print(f"\nSubgraph for visualization:")
+    print(f"  Nodes: {H.number_of_nodes()}")
+    print(f"  Edges: {H.number_of_edges()}")
+    
+    # Plot
+    fig = plot_tf_network_pretty(H, largest_scc & nodes_to_plot, 
+                                 top_masters, title=title)
+    
+    return fig, H, largest_scc, scores

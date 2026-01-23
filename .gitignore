@@ -8,8 +8,7 @@ __pycache__/
 *.pyc
 .env
 .vscode/
-*bed* 
-*gtf* 
+*bed*  
 *chip*
 *annotated*
 *pkl*
