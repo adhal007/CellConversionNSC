@@ -10,14 +10,11 @@ import matplotlib.patches as mpatches
 import pybedtools
 from tqdm import tqdm
 
-def sigmoid(x):
-    """Sigmoid function."""
-    return 1 / (1 + np.exp(-x))
-
 class GRNCo:
     """
     Wrapper for CellOracle TF motif scanning on ATAC peaks.
     """
+
     def __init__(self, bed_path, ref_genome="mm39", genomes_dir=None):
         self.bed_path = bed_path
         self.ref_genome = ref_genome
@@ -488,8 +485,8 @@ class GRNBuilder:
                 values='signal_value'
             )
             signal_matrix.append(wide_df)
-        signal_matrix_df = pd.concat(signal_matrix)
-        return signal_matrix_df
+            signal_matrix_df = pd.concat(signal_matrix)
+            return signal_matrix_df
     
     def compute_element_zscores_parallel(self, 
                                         all_e14_peak_files, all_e18_peak_files,  # Global distribution

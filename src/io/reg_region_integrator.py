@@ -3,10 +3,10 @@ Simple classes for ATAC-seq consensus peaks and enhancer integration.
 """
 
 import pandas as pd
+import pyranges as pr
+from pyliftover import LiftOver
 from pathlib import Path
-
-# NOTE: Heavy imports (pyranges, pybedtools, pyliftover) are imported lazily
-# inside methods that use them to speed up module loading
+import pybedtools
 
 class ConsensusPeakBuilder:
     """Create consensus peaks from ATAC-seq narrowPeak files."""
@@ -36,8 +36,6 @@ class ConsensusPeakBuilder:
 
     def build_consensus(self):
         """Load all peaks and merge to create consensus."""
-        import pyranges as pr  # Lazy import
-        
         all_peaks = []
         
         for _, row in self.samples.iterrows():
@@ -65,8 +63,6 @@ class ConsensusPeakBuilder:
         return consensus.df
     def build_consensus_by_condition(self):
         """Build separate consensus peaks for each condition (FAST VERSION)."""
-        import pyranges as pr  # Lazy import
-        
         condition_consensus = {}
         
         for condition in self.samples['Condition'].unique():
@@ -144,17 +140,9 @@ class EnhancerIntegrator:
         self.enhancer_files = enhancer_files
         self.from_assembly = from_assembly
         self.enhancers_mm39 = None
-        self.lo = None  # Initialize as None, will be loaded lazily
         
-        print(f"EnhancerIntegrator initialized (liftOver from {from_assembly} to mm39 will load when needed)")
-    
-    def _get_liftover(self):
-        """Lazy initialization of LiftOver object."""
-        if self.lo is None:
-            from pyliftover import LiftOver
-            print(f"Loading liftOver chain: {self.from_assembly} → mm39...")
-            self.lo = LiftOver(self.from_assembly, 'mm39')
-        return self.lo
+        print(f"Initializing liftOver from {from_assembly} to mm39...")
+        self.lo = LiftOver(from_assembly, 'mm39')
     
     def load_and_liftover(self):
         """Load enhancers and liftover to mm39."""
@@ -187,14 +175,13 @@ class EnhancerIntegrator:
         
         print(f"Loaded {len(combined)} unique enhancer-gene pairs in {self.from_assembly}")
         
-        # LiftOver to mm39 (lazy initialization)
-        lo = self._get_liftover()
+        # LiftOver to mm39
         print(f"Lifting over to mm39...")
         lifted = []
         failed = 0
         
         for _, row in combined.iterrows():
-            result = lo.convert_coordinate(row['chr'], int(row['start']))
+            result = self.lo.convert_coordinate(row['chr'], int(row['start']))
             
             if result:
                 new_chr, new_start, _, _ = result[0]
@@ -222,8 +209,6 @@ class EnhancerIntegrator:
         Overlap enhancers with consensus peaks.
         Returns formatted overlaps with peak_id.
         """
-        import pyranges as pr  # Lazy import
-        
         if self.enhancers_mm39 is None:
             raise ValueError("Load and liftover enhancers first!")
         
@@ -275,7 +260,6 @@ class EnhancerIntegrator:
         Returns:
             overlaps_df with 'is_DA' column added
         """
-        import pybedtools  # Lazy import
 
         # Make a copy so we don't modify the input
         overlaps_df = overlaps_df.copy()
@@ -307,66 +291,134 @@ class EnhancerIntegrator:
         return overlaps_df
     
 class RegulatoryRegionMaker:
-    """
-    Helper class for creating regulatory regions.
-    Uses functions from gtf_parser module instead of duplicating code.
-    """
-    
-    def __init__(self, gtf_path: str, chip_peaks_path: str = None):
-        """
-        Initialize RegulatoryRegionMaker.
-        
-        Parameters
-        ----------
-        gtf_path : str
-            Path to GTF file
-        chip_peaks_path : str, optional
-            Path to ChIP peaks file
-        """
-        from pathlib import Path
-        from src.io.gtf_parser import parse_gtf_gene_mapping, get_promoters_from_gtf
-        
-        self.gtf_path = Path(gtf_path)
-        self.chip_peaks_path = Path(chip_peaks_path) if chip_peaks_path else None
-        
-        # Data containers
+    def __init__(self):
+        # NEW containers
         self.promoters = None
         self.chip_peaks = None
-        self.ensembl_to_symbol = None
-    
-    def load_data(self):
-        """Load GTF data and ChIP peaks."""
-        from src.io.gtf_parser import parse_gtf_gene_mapping, get_promoters_from_gtf
-        
-        print("\n" + "=" * 60)
-        print("Loading Regulatory Region Data")
-        print("=" * 60)
-        
+
+
+    def _load_data(self):
         # 1. Parse GTF for gene mappings
         print("\n[1/3] Parsing GTF for gene symbol mappings...")
-        self.ensembl_to_symbol = parse_gtf_gene_mapping(str(self.gtf_path))
+        self.ensembl_to_symbol = self._parse_gtf_gene_mapping()
         
-        # 2. Generate promoters from GTF
-        print("\n[2/3] Generating promoters from GTF...")
-        self.promoters = get_promoters_from_gtf(str(self.gtf_path), window=2000)
-        print(f"      {len(self.promoters)} promoters")
-        
-        # 3. Load ChIP peaks (if provided)
-        if self.chip_peaks_path and self.chip_peaks_path.exists():
-            print("\n[3/3] Loading ChIP-seq peaks...")
-            from src.io.data_loaders import ChIPSeqRepository
-            self.chip_peaks = ChIPSeqRepository.load_chip_peaks_bed(str(self.chip_peaks_path))
-            print(f"      {len(self.chip_peaks)} peaks")
-            print(f"      {self.chip_peaks['TF'].nunique()} unique TFs")
-        else:
-            print("\n[3/3] No ChIP peaks file provided, skipping...")
-            self.chip_peaks = None
+        mapped = sum(1 for g in self.counts.index if g in self.ensembl_to_symbol)
+        print(f"      Counts genes with mapping: {mapped} / {len(self.counts)}")
         
         print("\n" + "=" * 60)
         print("Data loaded successfully!")
         print("=" * 60)
+
+        # 2. Generate promoters from GTF
+        print("\n[2/3] Generating promoters from GTF...")
+        self.promoters = self._get_promoters_from_gtf(window=2000)
+        print(f"      {len(self.promoters)} promoters")
+
+        # 3. Load ChIP peaks (if provided)
+        if self.paths['chip_peaks'] and self.paths['chip_peaks'].exists():
+            print("\n[3/3] Loading ChIP-seq peaks...")
+            self.chip_peaks = self._load_chip_peaks()
+            print(f"      {len(self.chip_peaks)} peaks")
+            print(f"      {self.chip_peaks['TF'].nunique()} unique TFs")
+        else:
+            print("\n[13/13] No ChIP peaks file provided, skipping...")
+            self.chip_peaks = None
+
+    def _parse_gtf_gene_mapping(self) -> Dict[str, str]:
+        """Parse GTF file to create Ensembl ID -> Gene Symbol mapping."""
+        print("      Parsing GTF for gene mappings...")
         
-        return self
+        ensembl_to_symbol = {}
+        
+        with open(self.paths['gtf'], 'r') as f:
+            for line in f:
+                if line.startswith('#'):
+                    continue
+                
+                fields = line.strip().split('\t')
+                if len(fields) < 9:
+                    continue
+                
+                # Only parse gene entries
+                if fields[2] != 'gene':
+                    continue
+                
+                attributes = fields[8]
+                
+                # Extract gene_id and gene_name
+                gene_id = None
+                gene_name = None
+                
+                for attr in attributes.split(';'):
+                    attr = attr.strip()
+                    if attr.startswith('gene_id'):
+                        # gene_id "ENSMUSG00000000001.5"
+                        gene_id = attr.split('"')[1].split('.')[0]  # Remove version
+                    elif attr.startswith('gene_name'):
+                        # gene_name "Gnai3"
+                        gene_name = attr.split('"')[1]
+                
+                if gene_id and gene_name:
+                    ensembl_to_symbol[gene_id] = gene_name
+        
+        print(f"      Parsed {len(ensembl_to_symbol)} gene mappings from GTF")
+        return ensembl_to_symbol
+    
+    def _get_promoters_from_gtf(self, window=2000):
+        """
+        Extract promoter regions (UPSTREAM of TSS) from GTF.
+        
+        Promoter = window bp UPSTREAM of TSS
+        """
+        promoters = []
+        
+        with open(self.paths['gtf']) as f:
+            for line in f:
+                if line.startswith('#'):
+                    continue
+                
+                fields = line.strip().split('\t')
+                if fields[2] != 'gene':
+                    continue
+                
+                chrom = fields[0]
+                start = int(fields[3])
+                end = int(fields[4])
+                strand = fields[6]
+                
+                # Extract gene symbol
+                attrs = {}
+                for item in fields[8].split(';'):
+                    if not item.strip():
+                        continue
+                    key_val = item.strip().split(' ', 1)
+                    if len(key_val) == 2:
+                        attrs[key_val[0]] = key_val[1].strip('"')
+                
+                gene_name = attrs.get('gene_name', '')
+                
+                # Get TSS and promoter based on strand
+                if strand == '+':
+                    tss = start
+                    # Promoter is UPSTREAM (before gene start)
+                    promoter_start = max(0, tss - window)
+                    promoter_end = tss
+                else:  # - strand
+                    tss = end
+                    # Promoter is UPSTREAM (after gene end in coordinates)
+                    promoter_start = tss
+                    promoter_end = tss + window
+                
+                promoters.append({
+                    'chr': chrom,
+                    'start': promoter_start,
+                    'end': promoter_end,
+                    'gene': gene_name,
+                    'strand': strand,
+                    'tss': tss
+                })
+        
+        return pd.DataFrame(promoters)
 ##############################################################################################################
 ##############################################################################################################
     def create_merged_regulatory_regions(self, promoters, enhancers):
@@ -379,8 +431,6 @@ class RegulatoryRegionMaker:
         
         Different-gene overlaps are FINE - both regions stay separate.
         """
-        import pyranges as pr  # Lazy import
-        
         print("\n" + "="*80)
         print("CREATING MERGED REGULATORY REGIONS")
         print("="*80)
