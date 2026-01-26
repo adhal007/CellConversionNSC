@@ -242,6 +242,14 @@ class GRNBuilder:
             self.merged_regulatory['gene']
         ))
         
+        # Create UNIQUE string element_key with gene included
+        self.merged_regulatory['element_key'] = (
+            self.merged_regulatory['chr'].astype(str) + ':' +
+            self.merged_regulatory['start'].astype(str) + '-' +
+            self.merged_regulatory['end'].astype(str) + '_' +
+            self.merged_regulatory['gene'].astype(str)
+        )
+        
         self.merged_regulatory['da_fold'] = self.merged_regulatory['element_key_tuple'].map(
             lambda k: element_da_status.get(k, 0)
         )
@@ -268,13 +276,7 @@ class GRNBuilder:
         print("STEP 3: TF-ELEMENT BINDING B_{t,r} (ReMap)")
         print("="*80)
         
-        # Create element_key string
-        self.merged_regulatory['element_key'] = (
-            self.merged_regulatory['chr'].astype(str) + ':' +
-            self.merged_regulatory['start'].astype(str) + '-' +
-            self.merged_regulatory['end'].astype(str)
-        )
-        
+        # element_key already exists from compute_da_indicators()
         remap_bed = pybedtools.BedTool.from_dataframe(
             self.remap_peaks[['chr', 'start', 'end', 'TF']]
         )
@@ -283,13 +285,13 @@ class GRNBuilder:
             self.merged_regulatory[['chr', 'start', 'end', 'element_key']]
         )
         
-        # Intersect
-        chip_overlap = remap_bed.intersect(regulatory_bed, wa=True, wb=True)
+        # Intersect: regulatory elements first
+        chip_overlap = regulatory_bed.intersect(remap_bed, wa=True, wb=True)
         
         # Convert to DataFrame
         self.chip_overlap_df = chip_overlap.to_dataframe(
-            names=['chr_tf', 'start_tf', 'end_tf', 'TF',
-                   'chr_el', 'start_el', 'end_el', 'element_key']
+            names=['chr_el', 'start_el', 'end_el', 'element_key',
+                'chr_tf', 'start_tf', 'end_tf', 'TF']
         )
         
         # Canonicalize TF names
@@ -417,76 +419,318 @@ class GRNBuilder:
         print(f"\nSaved:")
         print(f"  {e14_path}")
         print(f"  {e18_path}")
-    
-    def create_atac_signal_matrix(self, all_files):
+
+    def build_condition_grns(self, zscore_threshold=2.0):
         """
-        Create signal matrix: regulatory elements x samples (parallelized).
+        Step 4: Build condition-specific GRNs with expanded regulatory element selection.
+        
+        Uses OR logic for regulatory elements:
+        - DA status (D_E14 == 1 or D_E18 == 1), OR
+        - High accessibility (zscore_E14 > threshold or zscore_E18 > threshold)
+        
+        Combines:
+        - TF ChIP binding (ReMap)
+        - Expanded regulatory elements (DA OR high z-score)
+        - DE genes (TF and target)
+        
+        TF–TF edges are derived ONLY from ChIP+regulatory+DE evidence
+        (no TF–TF priors added).
         
         Args:
-            e14_peak_files: List of E14 narrowPeak file paths
-            e18_peak_files: List of E18 narrowPeak file paths
-            e14_sample_ids: List of E14 sample IDs
-            e18_sample_ids: List of E18 sample IDs
-            n_cores: Number of cores for parallel processing
+            grn_builder: GRNBuilder instance
+            zscore_threshold: Minimum sum of z-scores to consider element as accessible (default: 2.0)
         
         Returns:
-            signal_matrix: DataFrame with elements as rows, samples as columns
+            grn_e14, grn_e18: Condition-specific GRNs
+        """
+        import pandas as pd
+        
+        print("\n" + "=" * 80)
+        print("STEP 4: BUILD CONDITION-SPECIFIC GRNs (DA OR Z-SCORE)")
+        print("=" * 80)
+        print(f"Z-score threshold: {zscore_threshold}")
+        
+        # Check if z-scores are computed
+        if 'E14_mean_z_score' not in self.merged_regulatory.columns:
+            print("\nWARNING: Z-scores not found. Using DA status only.")
+            use_zscores = False
+        else:
+            use_zscores = True
+        
+        # ------------------
+        # E14 GRN
+        # ------------------
+        print("\n" + "-" * 80)
+        print("Building E14 GRN")
+        print("-" * 80)
+        
+        # Get DE TFs with ChIP binding
+        e14_chip_df = self.chip_overlap_df[
+            self.chip_overlap_df['TF'].isin(
+                [tf.upper() for tf in self.de_e14_tfs]
+            )
+        ].reset_index(drop=True)
+        
+        print(f"E14 DE TFs with ChIP: {e14_chip_df['TF'].nunique()}")
+        
+        # Get regulatory elements for DE genes
+        e14_DA_de_df = self.merged_regulatory[
+            self.merged_regulatory['gene'].isin(self.de_e14_genes)
+        ].reset_index(drop=True)
+        
+        print(f"Regulatory elements for E14 DE genes: {len(e14_DA_de_df)}")
+        
+        # Apply OR logic: DA status OR high z-score
+        if use_zscores:
+            e14_active_elements = e14_DA_de_df[
+                (e14_DA_de_df['D_E14'] == 1) |  # DA in E14
+                (e14_DA_de_df['E14_mean_z_score'] > zscore_threshold)  # OR high accessibility in E14
+            ].reset_index(drop=True)
+            
+            # Statistics
+            da_only = e14_DA_de_df[
+                (e14_DA_de_df['D_E14'] == 1)
+            ]
+            zscore_only = e14_DA_de_df[
+                (e14_DA_de_df['D_E14'] == 0) & 
+                (e14_DA_de_df['E14_mean_z_score'] > zscore_threshold)
+            ]
+            both = e14_DA_de_df[
+                (e14_DA_de_df['D_E14'] == 1) & 
+                (e14_DA_de_df['E14_mean_z_score'] > zscore_threshold)
+            ]
+            
+            print(f"\nE14 Element Selection (OR logic):")
+            print(f"  DA only: {len(da_only)}")
+            print(f"  Z-score only: {len(zscore_only)}")
+            print(f"  Both DA and Z-score: {len(both)}")
+            print(f"  Total active elements: {len(e14_active_elements)}")
+            
+        else:
+            # Fall back to DA only
+            e14_active_elements = e14_DA_de_df[
+                e14_DA_de_df['D_E14'] == 1
+            ].reset_index(drop=True)
+            print(f"Active elements (DA only): {len(e14_active_elements)}")
+        
+        # Merge: TF ChIP + active element + DE gene
+        e14_tf_target_de_da = pd.merge(
+            e14_chip_df,
+            e14_active_elements,
+            on='element_key'
+        )
+        
+        print(f"\nE14 TF→gene pairs (ChIP + Active + DE): {len(e14_tf_target_de_da)}")
+        
+        # TF → gene edges (all targets)
+        grn_e14_tf_gene = e14_tf_target_de_da[['TF', 'gene']].drop_duplicates()
+        
+        # TF → TF edges (ONLY from ChIP+Active+DE where target is also a TF)
+        grn_e14_tf_tf = e14_tf_target_de_da[
+            e14_tf_target_de_da['gene'].isin(self.de_e14_tfs)
+        ][['TF', 'gene']].drop_duplicates()
+        
+        # Combine
+        self.grn_e14 = pd.concat(
+            [grn_e14_tf_gene, grn_e14_tf_tf]
+        ).drop_duplicates()
+        
+        # Remove autoregulation
+        self.grn_e14 = self.grn_e14[
+            self.grn_e14['TF'] != self.grn_e14['gene']
+        ].reset_index(drop=True)
+        
+        # ------------------
+        # E18 GRN
+        # ------------------
+        print("\n" + "-" * 80)
+        print("Building E18 GRN")
+        print("-" * 80)
+        
+        # Get DE TFs with ChIP binding
+        e18_chip_df = self.chip_overlap_df[
+            self.chip_overlap_df['TF'].isin(
+                [tf.upper() for tf in self.de_e18_tfs]
+            )
+        ].reset_index(drop=True)
+        
+        print(f"E18 DE TFs with ChIP: {e18_chip_df['TF'].nunique()}")
+        
+        # Get regulatory elements for DE genes
+        e18_DA_de_df = self.merged_regulatory[
+            self.merged_regulatory['gene'].isin(self.de_e18_genes)
+        ].reset_index(drop=True)
+        
+        print(f"Regulatory elements for E18 DE genes: {len(e18_DA_de_df)}")
+        
+        # Apply OR logic: DA status OR high z-score
+        if use_zscores:
+            e18_active_elements = e18_DA_de_df[
+                (e18_DA_de_df['D_E18'] == 1) |  # DA in E18
+                (e18_DA_de_df['E18_mean_z_score'] > zscore_threshold)  # OR high accessibility in E18
+            ].reset_index(drop=True)
+            
+            # Statistics
+            da_only = e18_DA_de_df[
+                (e18_DA_de_df['D_E18'] == 1) & 
+                (e18_DA_de_df['E18_mean_z_score'] <= zscore_threshold)
+            ]
+            zscore_only = e18_DA_de_df[
+                (e18_DA_de_df['D_E18'] == 0) & 
+                (e18_DA_de_df['E18_mean_z_score'] > zscore_threshold)
+            ]
+            both = e18_DA_de_df[
+                (e18_DA_de_df['D_E18'] == 1) & 
+                (e18_DA_de_df['E18_mean_z_score'] > zscore_threshold)
+            ]
+            
+            print(f"\nE18 Element Selection (OR logic):")
+            print(f"  DA only: {len(da_only)}")
+            print(f"  Z-score only: {len(zscore_only)}")
+            print(f"  Both DA and Z-score: {len(both)}")
+            print(f"  Total active elements: {len(e18_active_elements)}")
+            
+        else:
+            # Fall back to DA only
+            e18_active_elements = e18_DA_de_df[
+                e18_DA_de_df['D_E18'] == 1
+            ].reset_index(drop=True)
+            print(f"Active elements (DA only): {len(e18_active_elements)}")
+        
+        # Merge: TF ChIP + active element + DE gene
+        e18_tf_target_de_da = pd.merge(
+            e18_chip_df,
+            e18_active_elements,
+            on='element_key'
+        )
+        
+        print(f"\nE18 TF→gene pairs (ChIP + Active + DE): {len(e18_tf_target_de_da)}")
+        
+        # TF → gene edges (all targets)
+        grn_e18_tf_gene = e18_tf_target_de_da[['TF', 'gene']].drop_duplicates()
+        
+        # TF → TF edges (ONLY from ChIP+Active+DE where target is also a TF)
+        grn_e18_tf_tf = e18_tf_target_de_da[
+            e18_tf_target_de_da['gene'].isin(self.de_e18_tfs)
+        ][['TF', 'gene']].drop_duplicates()
+        
+        # Combine
+        self.grn_e18 = pd.concat(
+            [grn_e18_tf_gene, grn_e18_tf_tf]
+        ).drop_duplicates()
+        
+        # Remove autoregulation
+        self.grn_e18 = self.grn_e18[
+            self.grn_e18['TF'] != self.grn_e18['gene']
+        ].reset_index(drop=True)
+        
+        # ------------------
+        # Summary
+        # ------------------
+        print("\n" + "=" * 80)
+        print("FINAL GRN SUMMARY")
+        print("=" * 80)
+        print(
+            f"E14 GRN: {len(self.grn_e14)} edges, "
+            f"{self.grn_e14['TF'].nunique()} TFs, "
+            f"{self.grn_e14['gene'].nunique()} targets"
+        )
+        print(
+            f"E18 GRN: {len(self.grn_e18)} edges, "
+            f"{self.grn_e18['TF'].nunique()} TFs, "
+            f"{self.grn_e18['gene'].nunique()} targets"
+        )
+        
+        # Store element selection dataframes for inspection
+        self.e14_active_elements = e14_active_elements
+        self.e18_active_elements = e18_active_elements
+        
+        return self.grn_e14, self.grn_e18
+
+
+    # ==============================================================================
+    # USAGE EXAMPLE
+    # ==============================================================================
+    """
+    # Test with different z-score thresholds
+    grn_e14, grn_e18 = build_condition_grns(grn_builder, zscore_threshold=2.0)
+
+    # Try more stringent threshold
+    grn_e14_strict, grn_e18_strict = build_condition_grns(grn_builder, zscore_threshold=3.0)
+
+    # Try more permissive threshold
+    grn_e14_permissive, grn_e18_permissive = build_condition_grns(grn_builder, zscore_threshold=1.0)
+
+    # Inspect active elements
+    print(grn_builder.e14_active_elements[['chr', 'start', 'end', 'gene', 'region_type', 
+                                        'D_E14', 'zscore_E14']].head(20))
+
+    # Compare DA-only vs z-score-only elements
+    da_only_e14 = grn_builder.e14_active_elements[
+        (grn_builder.e14_active_elements['D_E14'] == 1) & 
+        (grn_builder.e14_active_elements['zscore_E14'] <= 2.0)
+    ]
+    zscore_only_e14 = grn_builder.e14_active_elements[
+        (grn_builder.e14_active_elements['D_E14'] == 0) & 
+        (grn_builder.e14_active_elements['zscore_E14'] > 2.0)
+    ]
+
+    print(f"\\nDA-only elements in E14: {len(da_only_e14)}")
+    print(f"Z-score-only elements in E14: {len(zscore_only_e14)}")
+    """
+    def create_atac_signal_matrix(self, all_files):
+        """
+        Create signal matrix: regulatory elements x samples.
+        
+        For each regulatory element, find overlapping peaks and take max signal.
+        If no overlap, signal = 0.
+        
+        Returns:
+            signal_matrix: DataFrame with samples as rows, elements as columns
         """
         signal_matrix = []
+        
         for PEAK_FILE in all_files:
             peaks = pd.read_csv(PEAK_FILE, sep='\t', header=None,
                             names=['chr', 'start', 'end', 'name', 'score', 
                                     'strand', 'signalValue', 'pValue', 'qValue', 'peak'])
             sample_id = PEAK_FILE.split('/')[-1].split('_')[0]
             reg_df = self.merged_regulatory
-            # Overlap
-            peaks_bed = pybedtools.BedTool.from_dataframe(peaks[['chr', 'start', 'end', 'signalValue']])
+            
+            # Overlap: reg_bed with peaks_bed (regulatory regions first)
             reg_bed = pybedtools.BedTool.from_dataframe(reg_df[['chr', 'start', 'end', 'element_key']])
+            peaks_bed = pybedtools.BedTool.from_dataframe(peaks[['chr', 'start', 'end', 'signalValue']])
             
-            overlap = peaks_bed.intersect(reg_bed, wa=True, wb=True)
+            overlap = reg_bed.intersect(peaks_bed, wa=True, wb=True)
             
-            # Collect signals for this sample
+            # Collect signals for this sample (take max if multiple peaks overlap one element)
             sample_signals = {}
             for interval in overlap:
-                signal = float(interval[3])
-                element_key = interval[7]
-                sample_signals[element_key] = signal
-
+                element_key = interval[3]
+                signal = float(interval[7])  # signalValue from peak
+                
+                if element_key not in sample_signals:
+                    sample_signals[element_key] = signal
+                else:
+                    sample_signals[element_key] = max(sample_signals[element_key], signal)
             
-            sample_signal_df = pd.DataFrame(pd.Series(sample_signals)).reset_index()
-            sample_signal_df.columns = ['element_key', 'signal_value']
-            sample_signal_df['sample_id'] = sample_id
-            element_keys_not_in_sample = reg_df[~reg_df['element_key'].isin(sample_signal_df)]['element_key'].tolist()
-            
-            # Create dataframe for missing elements with 0 signal
-            missing_df = pd.DataFrame({
-                'element_key': element_keys_not_in_sample,
-                'signal_value': 0.0,
+            # Create complete dataframe with all elements
+            sample_signal_df = pd.DataFrame({
+                'element_key': reg_df['element_key'].tolist(),
+                'signal_value': [sample_signals.get(k, 0.0) for k in reg_df['element_key']],
                 'sample_id': sample_id
             })
             
-            # Concatenate with existing signals
-            sample_signal_df_complete = pd.concat([sample_signal_df, missing_df], ignore_index=True)
-            
-            # print(f"Original: {len(sample_signal_df)} elements with signal")
-            # print(f"Missing: {len(missing_df)} elements with no signal")
-            # print(f"Complete: {len(sample_signal_df_complete)} total elements")
-            
-            # Aggregate duplicates by taking the maximum signal per element per sample
-            sample_signal_df_agg = sample_signal_df_complete.groupby(
-                ['sample_id', 'element_key'], 
-                as_index=False
-            )['signal_value'].max()
-            
-            # Now pivot
-            wide_df = sample_signal_df_agg.pivot(
+            # Pivot to wide format
+            wide_df = sample_signal_df.pivot(
                 index='sample_id', 
                 columns='element_key', 
                 values='signal_value'
             )
             signal_matrix.append(wide_df)
-            signal_matrix_df = pd.concat(signal_matrix)
-            return signal_matrix_df
+        
+        signal_matrix_df = pd.concat(signal_matrix)
+        return signal_matrix_df
     
     def compute_element_zscores_parallel(self, 
                                         all_e14_peak_files, all_e18_peak_files,  # Global distribution
