@@ -27,6 +27,9 @@ class DifferentialExpressionStrategy(ABC):
         group1: str,
         group2: str,
         group_col: str,
+        ensembl_to_symbol: Dict[str, str] = None,  # ADD
+        tf_ensembl: set = None,  # ADD
+        tf_symbols: set = None,  # ADD
         **kwargs
     ) -> pd.DataFrame:
         """
@@ -158,7 +161,21 @@ class DESeq2Strategy(DifferentialExpressionStrategy):
         # Get results as DataFrame
         results = stat_res.results_df.copy()
         results['gene_id'] = results.index
-        
+
+        # Map Ensembl ID to gene symbol (ADD THIS)
+        ensembl_to_symbol = kwargs.get('ensembl_to_symbol', {})
+        tf_ensembl = kwargs.get('tf_ensembl', set())
+        tf_symbols = kwargs.get('tf_symbols', set())
+
+        results['symbol'] = results['gene_id'].map(ensembl_to_symbol)
+        results['symbol'] = results['symbol'].fillna(results['gene_id'])  # Keep ID if no mapping
+
+        # Annotate as TF (check both Ensembl ID and symbol)
+        results['is_TF'] = (
+            results['gene_id'].isin(tf_ensembl) | 
+            results['symbol'].isin(tf_symbols)
+        )
+        results['gene_type'] = results['is_TF'].map({True: 'TF', False: 'Gene'})
         # Add significance flag
         sig_mask = (results['padj'] < padj_threshold) & (results['log2FoldChange'].abs() > log2fc_threshold)
         results['significant'] = sig_mask
@@ -169,7 +186,9 @@ class DESeq2Strategy(DifferentialExpressionStrategy):
             group2,  # Positive = higher in group2
             group1   # Negative = higher in group1
         )
-        
+
+        results[f'E_{group1}'] = results['direction'] == group1
+        results[f'E_{group2}'] = results['direction'] == group2
         # Sort by adjusted p-value
         results = results.sort_values('padj')
         
@@ -265,13 +284,30 @@ class GJSDStrategy(DifferentialExpressionStrategy):
         
         # Add gene_id column
         results['gene_id'] = results.index
-        
+
+        # Map Ensembl ID to gene symbol (ADD THIS)
+        ensembl_to_symbol = kwargs.get('ensembl_to_symbol', {})
+        tf_ensembl = kwargs.get('tf_ensembl', set())
+        tf_symbols = kwargs.get('tf_symbols', set())
+
+        results['symbol'] = results['gene_id'].map(ensembl_to_symbol)
+        results['symbol'] = results['symbol'].fillna(results['gene_id'])
+
+        # Annotate as TF
+        results['is_TF'] = (
+            results['gene_id'].isin(tf_ensembl) | 
+            results['symbol'].isin(tf_symbols)
+        )
+        results['gene_type'] = results['is_TF'].map({True: 'TF', False: 'Gene'})
+
         # Add direction (for compatibility)
         results['direction'] = np.where(
             results.get('specificity_target', results.get('score', 0)) > 0,
             group2,
             group1
         )
+        results[f'E_{group1}'] = results['direction'] == group1
+        results[f'E_{group2}'] = results['direction'] == group2
         
         print(f"\n{'='*60}")
         print(f"{self.get_name()} Results Summary")
