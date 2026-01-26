@@ -120,7 +120,8 @@ class GRNBuilder:
     """
     
     def __init__(self, deseq_results, consensus_peaks, dar_results, 
-                 merged_regulatory, remap_peaks, tf_target_df, output_dir):
+                merged_regulatory, remap_peaks, tf_target_df, output_dir,
+                group1='E14', group2='E18'):  # ADD THIS
         """
         Initialize GRN builder.
         
@@ -132,6 +133,8 @@ class GRNBuilder:
             remap_peaks: ReMap peaks [chr, start, end, TF]
             tf_target_df: TF-target prior network [TF, Target]
             output_dir: Output directory
+            group1: str, default='E14' - Reference group name  # ADD
+            group2: str, default='E18' - Comparison group name  # ADD
         """
         self.deseq_results = deseq_results
         self.consensus_peaks = consensus_peaks
@@ -140,6 +143,8 @@ class GRNBuilder:
         self.remap_peaks = remap_peaks
         self.tf_target_df = tf_target_df
         self.output_dir = output_dir
+        self.group1 = group1  # ADD
+        self.group2 = group2  # ADD
         
         os.makedirs(output_dir, exist_ok=True)
         
@@ -156,30 +161,30 @@ class GRNBuilder:
         Step 1: Compute binary DE indicators E_x(c).
         
         Returns:
-            E_E14_dict, E_E18_dict: Gene -> binary DE indicator
+            dict, dict: Gene -> binary DE indicator for each group
         """
         print("\n" + "="*80)
         print("STEP 1: BINARY DE INDICATORS")
         print("="*80)
         
-        # E14: positive logFC
-        self.deseq_results['E_E14'] = (
+        # group1: positive logFC
+        self.deseq_results[f'E_{self.group1}'] = (
             (self.deseq_results['log2FoldChange'] > tau_lfc) & 
             (self.deseq_results['padj'] < tau_padj)
         ).astype(int)
         
-        # E18: negative logFC
-        self.deseq_results['E_E18'] = (
+        # group2: negative logFC
+        self.deseq_results[f'E_{self.group2}'] = (
             (self.deseq_results['log2FoldChange'] < -tau_lfc) & 
             (self.deseq_results['padj'] < tau_padj)
         ).astype(int)
         
-        print(f"E14 DE genes: {self.deseq_results['E_E14'].sum()}")
-        print(f"E18 DE genes: {self.deseq_results['E_E18'].sum()}")
+        print(f"{self.group1} DE genes: {self.deseq_results[f'E_{self.group1}'].sum()}")
+        print(f"{self.group2} DE genes: {self.deseq_results[f'E_{self.group2}'].sum()}")
         
-        # Create lookup dictionaries
-        self.E_E14_dict = self.deseq_results.set_index('symbol')['E_E14'].to_dict()
-        self.E_E18_dict = self.deseq_results.set_index('symbol')['E_E18'].to_dict()
+        # Create lookup dictionaries with dynamic attribute names
+        setattr(self, f'E_{self.group1}_dict', self.deseq_results.set_index('symbol')[f'E_{self.group1}'].to_dict())
+        setattr(self, f'E_{self.group2}_dict', self.deseq_results.set_index('symbol')[f'E_{self.group2}'].to_dict())
         
         # Store DE gene lists
         e14_cond = (self.deseq_results['padj'] < tau_padj) & (self.deseq_results['log2FoldChange'] > tau_lfc)
@@ -190,14 +195,15 @@ class GRNBuilder:
         self.de_e14_genes = self.deseq_results[e14_cond]['symbol'].to_numpy()
         self.de_e18_genes = self.deseq_results[e18_cond]['symbol'].to_numpy()
         
-        return self.E_E14_dict, self.E_E18_dict
+        # Return using getattr to get the stored attributes
+        return getattr(self, f'E_{self.group1}_dict'), getattr(self, f'E_{self.group2}_dict')
     
     def compute_da_indicators(self):
         """
         Step 2: Compute binary DA indicators D_r(c) for each regulatory element.
         
         Returns:
-            merged_regulatory with D_E14, D_E18 columns
+            merged_regulatory with D_{group1}, D_{group2} columns
         """
         print("\n" + "="*80)
         print("STEP 2: BINARY DA INDICATORS PER ELEMENT")
@@ -254,14 +260,14 @@ class GRNBuilder:
             lambda k: element_da_status.get(k, 0)
         )
         
-        # Binary indicators
-        self.merged_regulatory['D_E14'] = (self.merged_regulatory['da_fold'] > 0).astype(int)
-        self.merged_regulatory['D_E18'] = (self.merged_regulatory['da_fold'] < 0).astype(int)
+        # Binary indicators - CHANGED
+        self.merged_regulatory[f'D_{self.group1}'] = (self.merged_regulatory['da_fold'] > 0).astype(int)
+        self.merged_regulatory[f'D_{self.group2}'] = (self.merged_regulatory['da_fold'] < 0).astype(int)
         
         print(f"\nResults:")
         print(f"  Elements with DA: {(self.merged_regulatory['da_fold'] != 0).sum()}")
-        print(f"  Elements with E14 DA: {self.merged_regulatory['D_E14'].sum()}")
-        print(f"  Elements with E18 DA: {self.merged_regulatory['D_E18'].sum()}")
+        print(f"  Elements with {self.group1} DA: {self.merged_regulatory[f'D_{self.group1}'].sum()}")  # CHANGED
+        print(f"  Elements with {self.group2} DA: {self.merged_regulatory[f'D_{self.group2}'].sum()}")  # CHANGED
         
         return self.merged_regulatory
     
@@ -330,8 +336,8 @@ class GRNBuilder:
             self.chip_overlap_df['TF'].isin([tf.upper() for tf in self.de_e18_tfs])
         ].reset_index(drop=True)
         
-        print(f"E14 TFs with ChIP: {e14_chip_df['TF'].nunique()}")
-        print(f"E18 TFs with ChIP: {e18_chip_df['TF'].nunique()}")
+        print(f"{self.group1} TFs with ChIP: {e14_chip_df['TF'].nunique()}")  # CHANGED
+        print(f"{self.group2} TFs with ChIP: {e18_chip_df['TF'].nunique()}")  # CHANGED
         
         # Get DA regions for DE genes
         e14_DA_de_df = self.merged_regulatory[
@@ -345,18 +351,18 @@ class GRNBuilder:
         # Merge: TF ChIP + DA element + DE gene
         e14_tf_target_de_da = pd.merge(
             e14_chip_df,
-            e14_DA_de_df[e14_DA_de_df['D_E14'] == 1],
+            e14_DA_de_df[e14_DA_de_df[f'D_{self.group1}'] == 1],  # CHANGED
             on='element_key'
         )
         
         e18_tf_target_de_da = pd.merge(
             e18_chip_df,
-            e18_DA_de_df[e18_DA_de_df['D_E18'] == 1],
+            e18_DA_de_df[e18_DA_de_df[f'D_{self.group2}'] == 1],  # CHANGED
             on='element_key'
         )
         
-        print(f"\nE14 TF→gene pairs (ChIP + DA + DE): {len(e14_tf_target_de_da)}")
-        print(f"E18 TF→gene pairs (ChIP + DA + DE): {len(e18_tf_target_de_da)}")
+        print(f"\n{self.group1} TF→gene pairs (ChIP + DA + DE): {len(e14_tf_target_de_da)}")  # CHANGED
+        print(f"{self.group2} TF→gene pairs (ChIP + DA + DE): {len(e18_tf_target_de_da)}")  # CHANGED
         
         grn_e14 = e14_tf_target_de_da[['TF', 'gene']].drop_duplicates()
         grn_e18 = e18_tf_target_de_da[['TF', 'gene']].drop_duplicates()
@@ -403,11 +409,11 @@ class GRNBuilder:
         self.grn_e18.columns = ['TF', 'gene']
         
         print(f"\nFinal GRNs:")
-        print(f"  E14: {len(self.grn_e14)} edges, {self.grn_e14['TF'].nunique()} TFs, {self.grn_e14['gene'].nunique()} targets")
-        print(f"  E18: {len(self.grn_e18)} edges, {self.grn_e18['TF'].nunique()} TFs, {self.grn_e18['gene'].nunique()} targets")
+        print(f"  {self.group1}: {len(self.grn_e14)} edges, {self.grn_e14['TF'].nunique()} TFs, {self.grn_e14['gene'].nunique()} targets")  # CHANGED
+        print(f"  {self.group2}: {len(self.grn_e18)} edges, {self.grn_e18['TF'].nunique()} TFs, {self.grn_e18['gene'].nunique()} targets")  # CHANGED
         
         return self.grn_e14, self.grn_e18
-    
+        
     def save_grns(self):
         """Save condition-specific GRNs."""
         e14_path = os.path.join(self.output_dir, 'grn_e14.csv')
