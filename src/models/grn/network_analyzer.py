@@ -147,3 +147,21 @@ class NetworkAnalyzer:
         plt.axis('off')
         plt.tight_layout()
         plt.show()
+
+    def check_tf_tf_edges(self):
+        # Check E14 GRN
+        print("Total edges:", len(self.grn_df))
+        print("Unique TFs:", self.grn_df[self.tf_col].nunique())
+        print("Unique targets:", self.grn_df[self.target_col].nunique())
+
+        # Check how many targets are also TFs (TF-TF edges)
+        tf_set = set(self.deseq_results[self.deseq_results['is_TF']]['symbol'].str.upper())
+        tf_tf_edges = self.grn_df[self.grn_df[self.target_col].str.upper().isin(tf_set)]
+
+        print(f"\nTF-TF edges: {len(tf_tf_edges)}")
+        print(f"TF→non-TF edges: {len(self.grn_df) - len(tf_tf_edges)}")
+
+        if len(tf_tf_edges) > 0:
+            print("\nSample TF-TF edges:")
+            print(tf_tf_edges.head(10))
+        return tf_tf_edges 

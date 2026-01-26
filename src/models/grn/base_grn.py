@@ -308,382 +308,7 @@ class GRNBuilder:
         print(f"Unique elements bound: {self.chip_overlap_df['element_key'].nunique()}")
         
         return self.chip_overlap_df
-    
-    def build_condition_grns(self):
-        """
-        Step 4: Build condition-specific GRNs.
-        
-        Combines:
-        - TF ChIP binding (ReMap)
-        - DA regulatory elements
-        - DE genes (TF and target)
-        - TF-target prior network
-        
-        Returns:
-            grn_e14, grn_e18: Condition-specific GRNs
-        """
-        print("\n" + "="*80)
-        print("STEP 4: BUILD CONDITION-SPECIFIC GRNs")
-        print("="*80)
-        
-        # E14: DE TFs with ChIP binding
-        e14_chip_df = self.chip_overlap_df[
-            self.chip_overlap_df['TF'].isin([tf.upper() for tf in self.de_e14_tfs])
-        ].reset_index(drop=True)
-        
-        # E18: DE TFs with ChIP binding
-        e18_chip_df = self.chip_overlap_df[
-            self.chip_overlap_df['TF'].isin([tf.upper() for tf in self.de_e18_tfs])
-        ].reset_index(drop=True)
-        
-        print(f"{self.group1} TFs with ChIP: {e14_chip_df['TF'].nunique()}")  # CHANGED
-        print(f"{self.group2} TFs with ChIP: {e18_chip_df['TF'].nunique()}")  # CHANGED
-        
-        # Get DA regions for DE genes
-        e14_DA_de_df = self.merged_regulatory[
-            self.merged_regulatory['gene'].isin(self.de_e14_genes)
-        ].reset_index(drop=True)
-        
-        e18_DA_de_df = self.merged_regulatory[
-            self.merged_regulatory['gene'].isin(self.de_e18_genes)
-        ].reset_index(drop=True)
-        
-        # Merge: TF ChIP + DA element + DE gene
-        e14_tf_target_de_da = pd.merge(
-            e14_chip_df,
-            e14_DA_de_df[e14_DA_de_df[f'D_{self.group1}'] == 1],  # CHANGED
-            on='element_key'
-        )
-        
-        e18_tf_target_de_da = pd.merge(
-            e18_chip_df,
-            e18_DA_de_df[e18_DA_de_df[f'D_{self.group2}'] == 1],  # CHANGED
-            on='element_key'
-        )
-        
-        print(f"\n{self.group1} TF→gene pairs (ChIP + DA + DE): {len(e14_tf_target_de_da)}")  # CHANGED
-        print(f"{self.group2} TF→gene pairs (ChIP + DA + DE): {len(e18_tf_target_de_da)}")  # CHANGED
-        
-        grn_e14 = e14_tf_target_de_da[['TF', 'gene']].drop_duplicates()
-        grn_e18 = e18_tf_target_de_da[['TF', 'gene']].drop_duplicates()
-        
-        # Add TF-target prior edges where both TF and target are in GRN
-        print(f"\nAdding TF-TF prior edges...")
-        
-        # E14
-        TF_target_df_sub_e14 = self.tf_target_df[
-            (self.tf_target_df['TF'].isin(grn_e14['TF'])) &
-            (self.tf_target_df['Target'].isin(grn_e14['TF']))
-        ]
-        
-        grn_e14_for_merge = grn_e14.copy()
-        grn_e14_for_merge['gene'] = grn_e14_for_merge['gene'].str.upper()
-        grn_e14_for_merge.columns = ['TF', 'Target']
-        
-        self.grn_e14 = pd.concat([
-            TF_target_df_sub_e14[['TF', 'Target']],
-            grn_e14_for_merge
-        ]).drop_duplicates()
-        
-        # Remove autoregulation
-        self.grn_e14 = self.grn_e14[self.grn_e14['TF'] != self.grn_e14['Target']].reset_index(drop=True)
-        self.grn_e14.columns = ['TF', 'gene']
-        
-        # E18
-        TF_target_df_sub_e18 = self.tf_target_df[
-            (self.tf_target_df['TF'].isin(grn_e18['TF'])) &
-            (self.tf_target_df['Target'].isin(grn_e18['TF']))
-        ]
-        
-        grn_e18_for_merge = grn_e18.copy()
-        grn_e18_for_merge['gene'] = grn_e18_for_merge['gene'].str.upper()
-        grn_e18_for_merge.columns = ['TF', 'Target']
-        
-        self.grn_e18 = pd.concat([
-            TF_target_df_sub_e18[['TF', 'Target']],
-            grn_e18_for_merge
-        ]).drop_duplicates()
-        
-        # Remove autoregulation
-        self.grn_e18 = self.grn_e18[self.grn_e18['TF'] != self.grn_e18['Target']].reset_index(drop=True)
-        self.grn_e18.columns = ['TF', 'gene']
-        
-        print(f"\nFinal GRNs:")
-        print(f"  {self.group1}: {len(self.grn_e14)} edges, {self.grn_e14['TF'].nunique()} TFs, {self.grn_e14['gene'].nunique()} targets")  # CHANGED
-        print(f"  {self.group2}: {len(self.grn_e18)} edges, {self.grn_e18['TF'].nunique()} TFs, {self.grn_e18['gene'].nunique()} targets")  # CHANGED
-        
-        return self.grn_e14, self.grn_e18
-        
-    def save_grns(self):
-        """Save condition-specific GRNs."""
-        e14_path = os.path.join(self.output_dir, 'grn_e14.csv')
-        e18_path = os.path.join(self.output_dir, 'grn_e18.csv')
-        
-        self.grn_e14.to_csv(e14_path, index=False)
-        self.grn_e18.to_csv(e18_path, index=False)
-        
-        print(f"\nSaved:")
-        print(f"  {e14_path}")
-        print(f"  {e18_path}")
 
-    def build_condition_grns(self, zscore_threshold=2.0):
-        """
-        Step 4: Build condition-specific GRNs with expanded regulatory element selection.
-        
-        Uses OR logic for regulatory elements:
-        - DA status (D_E14 == 1 or D_E18 == 1), OR
-        - High accessibility (zscore_E14 > threshold or zscore_E18 > threshold)
-        
-        Combines:
-        - TF ChIP binding (ReMap)
-        - Expanded regulatory elements (DA OR high z-score)
-        - DE genes (TF and target)
-        
-        TF–TF edges are derived ONLY from ChIP+regulatory+DE evidence
-        (no TF–TF priors added).
-        
-        Args:
-            grn_builder: GRNBuilder instance
-            zscore_threshold: Minimum sum of z-scores to consider element as accessible (default: 2.0)
-        
-        Returns:
-            grn_e14, grn_e18: Condition-specific GRNs
-        """
-        import pandas as pd
-        
-        print("\n" + "=" * 80)
-        print("STEP 4: BUILD CONDITION-SPECIFIC GRNs (DA OR Z-SCORE)")
-        print("=" * 80)
-        print(f"Z-score threshold: {zscore_threshold}")
-        
-        # Check if z-scores are computed
-        if 'E14_mean_z_score' not in self.merged_regulatory.columns:
-            print("\nWARNING: Z-scores not found. Using DA status only.")
-            use_zscores = False
-        else:
-            use_zscores = True
-        
-        # ------------------
-        # E14 GRN
-        # ------------------
-        print("\n" + "-" * 80)
-        print("Building E14 GRN")
-        print("-" * 80)
-        
-        # Get DE TFs with ChIP binding
-        e14_chip_df = self.chip_overlap_df[
-            self.chip_overlap_df['TF'].isin(
-                [tf.upper() for tf in self.de_e14_tfs]
-            )
-        ].reset_index(drop=True)
-        
-        print(f"E14 DE TFs with ChIP: {e14_chip_df['TF'].nunique()}")
-        
-        # Get regulatory elements for DE genes
-        e14_DA_de_df = self.merged_regulatory[
-            self.merged_regulatory['gene'].isin(self.de_e14_genes)
-        ].reset_index(drop=True)
-        
-        print(f"Regulatory elements for E14 DE genes: {len(e14_DA_de_df)}")
-        
-        # Apply OR logic: DA status OR high z-score
-        if use_zscores:
-            e14_active_elements = e14_DA_de_df[
-                (e14_DA_de_df['D_E14'] == 1) |  # DA in E14
-                (e14_DA_de_df['E14_mean_z_score'] > zscore_threshold)  # OR high accessibility in E14
-            ].reset_index(drop=True)
-            
-            # Statistics
-            da_only = e14_DA_de_df[
-                (e14_DA_de_df['D_E14'] == 1)
-            ]
-            zscore_only = e14_DA_de_df[
-                (e14_DA_de_df['D_E14'] == 0) & 
-                (e14_DA_de_df['E14_mean_z_score'] > zscore_threshold)
-            ]
-            both = e14_DA_de_df[
-                (e14_DA_de_df['D_E14'] == 1) & 
-                (e14_DA_de_df['E14_mean_z_score'] > zscore_threshold)
-            ]
-            
-            print(f"\nE14 Element Selection (OR logic):")
-            print(f"  DA only: {len(da_only)}")
-            print(f"  Z-score only: {len(zscore_only)}")
-            print(f"  Both DA and Z-score: {len(both)}")
-            print(f"  Total active elements: {len(e14_active_elements)}")
-            
-        else:
-            # Fall back to DA only
-            e14_active_elements = e14_DA_de_df[
-                e14_DA_de_df['D_E14'] == 1
-            ].reset_index(drop=True)
-            print(f"Active elements (DA only): {len(e14_active_elements)}")
-        
-        # Merge: TF ChIP + active element + DE gene
-        e14_tf_target_de_da = pd.merge(
-            e14_chip_df,
-            e14_active_elements,
-            on='element_key'
-        )
-        
-        print(f"\nE14 TF→gene pairs (ChIP + Active + DE): {len(e14_tf_target_de_da)}")
-        
-        # TF → gene edges (all targets)
-        grn_e14_tf_gene = e14_tf_target_de_da[['TF', 'gene']].drop_duplicates()
-        
-        # TF → TF edges (ONLY from ChIP+Active+DE where target is also a TF)
-        grn_e14_tf_tf = e14_tf_target_de_da[
-            e14_tf_target_de_da['gene'].isin(self.de_e14_tfs)
-        ][['TF', 'gene']].drop_duplicates()
-        
-        # Combine
-        self.grn_e14 = pd.concat(
-            [grn_e14_tf_gene, grn_e14_tf_tf]
-        ).drop_duplicates()
-        
-        # Remove autoregulation
-        self.grn_e14 = self.grn_e14[
-            self.grn_e14['TF'] != self.grn_e14['gene']
-        ].reset_index(drop=True)
-        
-        # ------------------
-        # E18 GRN
-        # ------------------
-        print("\n" + "-" * 80)
-        print("Building E18 GRN")
-        print("-" * 80)
-        
-        # Get DE TFs with ChIP binding
-        e18_chip_df = self.chip_overlap_df[
-            self.chip_overlap_df['TF'].isin(
-                [tf.upper() for tf in self.de_e18_tfs]
-            )
-        ].reset_index(drop=True)
-        
-        print(f"E18 DE TFs with ChIP: {e18_chip_df['TF'].nunique()}")
-        
-        # Get regulatory elements for DE genes
-        e18_DA_de_df = self.merged_regulatory[
-            self.merged_regulatory['gene'].isin(self.de_e18_genes)
-        ].reset_index(drop=True)
-        
-        print(f"Regulatory elements for E18 DE genes: {len(e18_DA_de_df)}")
-        
-        # Apply OR logic: DA status OR high z-score
-        if use_zscores:
-            e18_active_elements = e18_DA_de_df[
-                (e18_DA_de_df['D_E18'] == 1) |  # DA in E18
-                (e18_DA_de_df['E18_mean_z_score'] > zscore_threshold)  # OR high accessibility in E18
-            ].reset_index(drop=True)
-            
-            # Statistics
-            da_only = e18_DA_de_df[
-                (e18_DA_de_df['D_E18'] == 1) & 
-                (e18_DA_de_df['E18_mean_z_score'] <= zscore_threshold)
-            ]
-            zscore_only = e18_DA_de_df[
-                (e18_DA_de_df['D_E18'] == 0) & 
-                (e18_DA_de_df['E18_mean_z_score'] > zscore_threshold)
-            ]
-            both = e18_DA_de_df[
-                (e18_DA_de_df['D_E18'] == 1) & 
-                (e18_DA_de_df['E18_mean_z_score'] > zscore_threshold)
-            ]
-            
-            print(f"\nE18 Element Selection (OR logic):")
-            print(f"  DA only: {len(da_only)}")
-            print(f"  Z-score only: {len(zscore_only)}")
-            print(f"  Both DA and Z-score: {len(both)}")
-            print(f"  Total active elements: {len(e18_active_elements)}")
-            
-        else:
-            # Fall back to DA only
-            e18_active_elements = e18_DA_de_df[
-                e18_DA_de_df['D_E18'] == 1
-            ].reset_index(drop=True)
-            print(f"Active elements (DA only): {len(e18_active_elements)}")
-        
-        # Merge: TF ChIP + active element + DE gene
-        e18_tf_target_de_da = pd.merge(
-            e18_chip_df,
-            e18_active_elements,
-            on='element_key'
-        )
-        
-        print(f"\nE18 TF→gene pairs (ChIP + Active + DE): {len(e18_tf_target_de_da)}")
-        
-        # TF → gene edges (all targets)
-        grn_e18_tf_gene = e18_tf_target_de_da[['TF', 'gene']].drop_duplicates()
-        
-        # TF → TF edges (ONLY from ChIP+Active+DE where target is also a TF)
-        grn_e18_tf_tf = e18_tf_target_de_da[
-            e18_tf_target_de_da['gene'].isin(self.de_e18_tfs)
-        ][['TF', 'gene']].drop_duplicates()
-        
-        # Combine
-        self.grn_e18 = pd.concat(
-            [grn_e18_tf_gene, grn_e18_tf_tf]
-        ).drop_duplicates()
-        
-        # Remove autoregulation
-        self.grn_e18 = self.grn_e18[
-            self.grn_e18['TF'] != self.grn_e18['gene']
-        ].reset_index(drop=True)
-        
-        # ------------------
-        # Summary
-        # ------------------
-        print("\n" + "=" * 80)
-        print("FINAL GRN SUMMARY")
-        print("=" * 80)
-        print(
-            f"E14 GRN: {len(self.grn_e14)} edges, "
-            f"{self.grn_e14['TF'].nunique()} TFs, "
-            f"{self.grn_e14['gene'].nunique()} targets"
-        )
-        print(
-            f"E18 GRN: {len(self.grn_e18)} edges, "
-            f"{self.grn_e18['TF'].nunique()} TFs, "
-            f"{self.grn_e18['gene'].nunique()} targets"
-        )
-        
-        # Store element selection dataframes for inspection
-        self.e14_active_elements = e14_active_elements
-        self.e18_active_elements = e18_active_elements
-        
-        return self.grn_e14, self.grn_e18
-
-
-    # ==============================================================================
-    # USAGE EXAMPLE
-    # ==============================================================================
-    """
-    # Test with different z-score thresholds
-    grn_e14, grn_e18 = build_condition_grns(grn_builder, zscore_threshold=2.0)
-
-    # Try more stringent threshold
-    grn_e14_strict, grn_e18_strict = build_condition_grns(grn_builder, zscore_threshold=3.0)
-
-    # Try more permissive threshold
-    grn_e14_permissive, grn_e18_permissive = build_condition_grns(grn_builder, zscore_threshold=1.0)
-
-    # Inspect active elements
-    print(grn_builder.e14_active_elements[['chr', 'start', 'end', 'gene', 'region_type', 
-                                        'D_E14', 'zscore_E14']].head(20))
-
-    # Compare DA-only vs z-score-only elements
-    da_only_e14 = grn_builder.e14_active_elements[
-        (grn_builder.e14_active_elements['D_E14'] == 1) & 
-        (grn_builder.e14_active_elements['zscore_E14'] <= 2.0)
-    ]
-    zscore_only_e14 = grn_builder.e14_active_elements[
-        (grn_builder.e14_active_elements['D_E14'] == 0) & 
-        (grn_builder.e14_active_elements['zscore_E14'] > 2.0)
-    ]
-
-    print(f"\\nDA-only elements in E14: {len(da_only_e14)}")
-    print(f"Z-score-only elements in E14: {len(zscore_only_e14)}")
-    """
     def create_atac_signal_matrix(self, all_files):
         """
         Create signal matrix: regulatory elements x samples.
@@ -737,6 +362,386 @@ class GRNBuilder:
         
         signal_matrix_df = pd.concat(signal_matrix)
         return signal_matrix_df
+    
+    
+    def compute_mad_normalized_accessibility(self, atac_meta, peak_dir, 
+                                            group1_samples, group2_samples,
+                                            plot=True):
+        """
+        Compute MAD-normalized accessibility scores for regulatory elements.
+        
+        Steps:
+        1. Create signal matrix from ATAC peak files
+        2. MAD normalize per element using global distribution
+        3. Compute mean MAD score per condition
+        4. Merge with merged_regulatory
+        
+        Args:
+            atac_meta: DataFrame with ATAC metadata
+            peak_dir: Directory containing narrowPeak files
+            group1_samples: List of sample IDs for group1 (e.g., CD133 E14 Cortex)
+            group2_samples: List of sample IDs for group2 (e.g., CD133 E18 Cortex)
+            plot: Whether to plot MAD score distributions
+            
+        Returns:
+            merged_regulatory with {group1}_mean_mad_score and {group2}_mean_mad_score columns
+        """
+        import scipy.stats as stats
+        import numpy as np
+        import matplotlib.pyplot as plt
+        import os
+        
+        print("\n" + "="*80)
+        print("COMPUTING MAD-NORMALIZED ACCESSIBILITY")
+        print("="*80)
+        
+        # Get all peak files for global distribution
+        all_samples = group1_samples + group2_samples
+        all_peak_files = [os.path.join(peak_dir, f"{s}_peaks.narrowPeak") for s in all_samples]
+        all_peak_files = [f for f in all_peak_files if os.path.exists(f)]
+        
+        print(f"\n{self.group1} samples: {len(group1_samples)}")
+        print(f"{self.group2} samples: {len(group2_samples)}")
+        print(f"Total peak files: {len(all_peak_files)}")
+        
+        # Create signal matrix
+        print("\nCreating ATAC signal matrix...")
+        signal_matrix = self.create_atac_signal_matrix(all_peak_files)
+        
+        # Remove all-zero columns
+        signal_matrix = signal_matrix.loc[:, (signal_matrix != 0).any()]
+        print(f"Signal matrix shape: {signal_matrix.shape}")
+        
+        # Step 1: Compute per-element (per column) median and MAD
+        # Use ALL samples to get global distribution per element
+        print("\nComputing per-element median and MAD...")
+        median_per_element = signal_matrix.median(axis=0)
+        mad_per_element = signal_matrix.apply(
+            lambda col: stats.median_abs_deviation(col, nan_policy='omit'), 
+            axis=0
+        )
+        
+        # Step 2: MAD normalize per element
+        # (value - median) / (1.4826 * MAD)
+        # 1.4826 makes MAD comparable to std for normal distribution
+        print("MAD normalizing...")
+        signal_matrix_mad_norm = (signal_matrix - median_per_element) / (1.4826 * mad_per_element)
+        
+        # Handle cases where MAD = 0 (constant signal)
+        signal_matrix_mad_norm = signal_matrix_mad_norm.replace([np.inf, -np.inf], 0).fillna(0)
+        
+        # Step 3: Compute mean MAD-normalized score per condition
+        print(f"\nComputing mean MAD scores per condition...")
+        group1_z = signal_matrix_mad_norm[
+            signal_matrix_mad_norm.index.isin(group1_samples)
+        ].mean(axis=0).reset_index()
+        
+        group2_z = signal_matrix_mad_norm[
+            signal_matrix_mad_norm.index.isin(group2_samples)
+        ].mean(axis=0).reset_index()
+        
+        # Set column names dynamically
+        group1_z.columns = ['element_key', f'{self.group1}_mean_mad_score']
+        group2_z.columns = ['element_key', f'{self.group2}_mean_mad_score']
+        
+        # Merge with merged_regulatory
+        print("\nMerging with regulatory regions...")
+        self.merged_regulatory = pd.merge(
+            self.merged_regulatory, 
+            group1_z, 
+            on='element_key', 
+            how='left'
+        )
+        self.merged_regulatory = pd.merge(
+            self.merged_regulatory, 
+            group2_z, 
+            on='element_key', 
+            how='left'
+        )
+        
+        # Fill NaN with 0 (elements not in ATAC peaks)
+        self.merged_regulatory[f'{self.group1}_mean_mad_score'] = \
+            self.merged_regulatory[f'{self.group1}_mean_mad_score'].fillna(0)
+        self.merged_regulatory[f'{self.group2}_mean_mad_score'] = \
+            self.merged_regulatory[f'{self.group2}_mean_mad_score'].fillna(0)
+        
+        # Print stats
+        print(f"\n{self.group1} MAD score range: "
+            f"[{group1_z[f'{self.group1}_mean_mad_score'].min():.2f}, "
+            f"{group1_z[f'{self.group1}_mean_mad_score'].max():.2f}]")
+        print(f"{self.group2} MAD score range: "
+            f"[{group2_z[f'{self.group2}_mean_mad_score'].min():.2f}, "
+            f"{group2_z[f'{self.group2}_mean_mad_score'].max():.2f}]")
+        
+        # Calculate Tukey thresholds
+        group1_col = f'{self.group1}_mean_mad_score'
+        group2_col = f'{self.group2}_mean_mad_score'
+        
+        iqr1 = np.percentile(self.merged_regulatory[group1_col], 75) - \
+            np.percentile(self.merged_regulatory[group1_col], 25)
+        tukey_thresh1 = np.percentile(self.merged_regulatory[group1_col], 75) + 1.5 * iqr1
+        
+        iqr2 = np.percentile(self.merged_regulatory[group2_col], 75) - \
+            np.percentile(self.merged_regulatory[group2_col], 25)
+        tukey_thresh2 = np.percentile(self.merged_regulatory[group2_col], 75) + 1.5 * iqr2
+        
+        print(f"\nTukey outlier thresholds (Q3 + 1.5*IQR):")
+        print(f"  {self.group1}: {tukey_thresh1:.2f}")
+        print(f"  {self.group2}: {tukey_thresh2:.2f}")
+        
+        # Store thresholds
+        self.mad_tukey_threshold_group1 = tukey_thresh1
+        self.mad_tukey_threshold_group2 = tukey_thresh2
+        
+        # Plot distribution
+        if plot:
+            plt.figure(figsize=(10, 6))
+            plt.hist(
+                group1_z[f'{self.group1}_mean_mad_score'], 
+                bins=50, alpha=0.5, label=self.group1, density=True
+            )
+            plt.hist(
+                group2_z[f'{self.group2}_mean_mad_score'], 
+                bins=50, alpha=0.5, label=self.group2, density=True
+            )
+            plt.xlabel('MAD Normalized Score')
+            plt.ylabel('Density')
+            plt.legend()
+            plt.title('Per-Element MAD Normalized Accessibility')
+            plt.axvline(tukey_thresh1, color='blue', linestyle='--', alpha=0.5, 
+                    label=f'{self.group1} Tukey threshold')
+            plt.axvline(tukey_thresh2, color='orange', linestyle='--', alpha=0.5,
+                    label=f'{self.group2} Tukey threshold')
+            plt.legend()
+            plt.show()
+        
+        print("\n" + "="*80)
+        print("MAD NORMALIZATION COMPLETE")
+        print("="*80)
+        print(f"Added columns: {group1_col}, {group2_col}")
+        
+        return self.merged_regulatory
+
+
+    def build_condition_grns(self, zscore_threshold_group1=2.0, zscore_threshold_group2=2.0):
+        """
+        Step 4: Build condition-specific GRNs with expanded regulatory element selection.
+        
+        Uses OR logic for regulatory elements:
+        - DA status (D_{group1} == 1 or D_{group2} == 1), OR
+        - High accessibility ({group1}_mean_mad_score > threshold or {group2}_mean_mad_score > threshold)
+        
+        Args:
+            zscore_threshold_group1: Minimum MAD score for group1 accessibility (default: 2.0)
+            zscore_threshold_group2: Minimum MAD score for group2 accessibility (default: 2.0)
+        
+        Returns:
+            grn_group1, grn_group2: Condition-specific GRNs
+        """
+        print("\n" + "=" * 80)
+        print("STEP 4: BUILD CONDITION-SPECIFIC GRNs (DA OR Z-SCORE)")
+        print("=" * 80)
+        print(f"{self.group1} MAD score threshold: {zscore_threshold_group1}")
+        print(f"{self.group2} MAD score threshold: {zscore_threshold_group2}")
+        
+        # Check if z-scores are computed
+        group1_zscore_col = f'{self.group1}_mean_mad_score'
+        group2_zscore_col = f'{self.group2}_mean_mad_score'
+        
+        if group1_zscore_col not in self.merged_regulatory.columns:
+            print("\nWARNING: MAD scores not found. Using DA status only.")
+            use_zscores = False
+        else:
+            use_zscores = True
+        
+        # ------------------
+        # Group1 GRN
+        # ------------------
+        print("\n" + "-" * 80)
+        print(f"Building {self.group1} GRN")
+        print("-" * 80)
+        
+        # Get DE TFs with ChIP binding
+        group1_chip_df = self.chip_overlap_df[
+            self.chip_overlap_df['TF'].isin(
+                [tf.upper() for tf in self.de_e14_tfs]
+            )
+        ].reset_index(drop=True)
+        
+        print(f"{self.group1} DE TFs with ChIP: {group1_chip_df['TF'].nunique()}")
+        
+        # Get regulatory elements for DE genes
+        group1_DA_de_df = self.merged_regulatory[
+            self.merged_regulatory['gene'].isin(self.de_e14_genes)
+        ].reset_index(drop=True)
+        
+        print(f"Regulatory elements for {self.group1} DE genes: {len(group1_DA_de_df)}")
+        
+        # Apply OR logic: DA status OR high MAD score
+        group1_da_col = f'D_{self.group1}'
+        
+        if use_zscores:
+            group1_active_elements = group1_DA_de_df[
+                (group1_DA_de_df[group1_da_col] == 1) |  # DA in group1
+                (group1_DA_de_df[group1_zscore_col] > zscore_threshold_group1)  # OR high accessibility
+            ].reset_index(drop=True)
+            
+            # Statistics
+            da_only = group1_DA_de_df[
+                (group1_DA_de_df[group1_da_col] == 1) & 
+                (group1_DA_de_df[group1_zscore_col] <= zscore_threshold_group1)
+            ]
+            zscore_only = group1_DA_de_df[
+                (group1_DA_de_df[group1_da_col] == 0) & 
+                (group1_DA_de_df[group1_zscore_col] > zscore_threshold_group1)
+            ]
+            both = group1_DA_de_df[
+                (group1_DA_de_df[group1_da_col] == 1) & 
+                (group1_DA_de_df[group1_zscore_col] > zscore_threshold_group1)
+            ]
+            
+            print(f"\n{self.group1} Element Selection (OR logic):")
+            print(f"  DA only: {len(da_only)}")
+            print(f"  MAD score only: {len(zscore_only)}")
+            print(f"  Both DA and MAD score: {len(both)}")
+            print(f"  Total active elements: {len(group1_active_elements)}")
+            
+        else:
+            # Fall back to DA only
+            group1_active_elements = group1_DA_de_df[
+                group1_DA_de_df[group1_da_col] == 1
+            ].reset_index(drop=True)
+            print(f"Active elements (DA only): {len(group1_active_elements)}")
+        
+        # Merge: TF ChIP + active element + DE gene
+        group1_tf_target_de_da = pd.merge(
+            group1_chip_df,
+            group1_active_elements,
+            on='element_key'
+        )
+        
+        print(f"\n{self.group1} TF→gene pairs (ChIP + Active + DE): {len(group1_tf_target_de_da)}")
+        
+        # TF → gene edges
+        grn_group1_all = group1_tf_target_de_da[['TF', 'gene']].drop_duplicates()
+        
+        # Remove autoregulation
+        self.grn_e14 = grn_group1_all[
+            grn_group1_all['TF'] != grn_group1_all['gene']
+        ].reset_index(drop=True)
+        
+        # ------------------
+        # Group2 GRN
+        # ------------------
+        print("\n" + "-" * 80)
+        print(f"Building {self.group2} GRN")
+        print("-" * 80)
+        
+        # Get DE TFs with ChIP binding
+        group2_chip_df = self.chip_overlap_df[
+            self.chip_overlap_df['TF'].isin(
+                [tf.upper() for tf in self.de_e18_tfs]
+            )
+        ].reset_index(drop=True)
+        
+        print(f"{self.group2} DE TFs with ChIP: {group2_chip_df['TF'].nunique()}")
+        
+        # Get regulatory elements for DE genes
+        group2_DA_de_df = self.merged_regulatory[
+            self.merged_regulatory['gene'].isin(self.de_e18_genes)
+        ].reset_index(drop=True)
+        
+        print(f"Regulatory elements for {self.group2} DE genes: {len(group2_DA_de_df)}")
+        
+        # Apply OR logic: DA status OR high MAD score
+        group2_da_col = f'D_{self.group2}'
+        
+        if use_zscores:
+            group2_active_elements = group2_DA_de_df[
+                (group2_DA_de_df[group2_da_col] == 1) |  # DA in group2
+                (group2_DA_de_df[group2_zscore_col] > zscore_threshold_group2)  # OR high accessibility
+            ].reset_index(drop=True)
+            
+            # Statistics
+            da_only = group2_DA_de_df[
+                (group2_DA_de_df[group2_da_col] == 1) & 
+                (group2_DA_de_df[group2_zscore_col] <= zscore_threshold_group2)
+            ]
+            zscore_only = group2_DA_de_df[
+                (group2_DA_de_df[group2_da_col] == 0) & 
+                (group2_DA_de_df[group2_zscore_col] > zscore_threshold_group2)
+            ]
+            both = group2_DA_de_df[
+                (group2_DA_de_df[group2_da_col] == 1) & 
+                (group2_DA_de_df[group2_zscore_col] > zscore_threshold_group2)
+            ]
+            
+            print(f"\n{self.group2} Element Selection (OR logic):")
+            print(f"  DA only: {len(da_only)}")
+            print(f"  MAD score only: {len(zscore_only)}")
+            print(f"  Both DA and MAD score: {len(both)}")
+            print(f"  Total active elements: {len(group2_active_elements)}")
+            
+        else:
+            # Fall back to DA only
+            group2_active_elements = group2_DA_de_df[
+                group2_DA_de_df[group2_da_col] == 1
+            ].reset_index(drop=True)
+            print(f"Active elements (DA only): {len(group2_active_elements)}")
+        
+        # Merge: TF ChIP + active element + DE gene
+        group2_tf_target_de_da = pd.merge(
+            group2_chip_df,
+            group2_active_elements,
+            on='element_key'
+        )
+        
+        print(f"\n{self.group2} TF→gene pairs (ChIP + Active + DE): {len(group2_tf_target_de_da)}")
+        
+        # TF → gene edges
+        grn_group2_all = group2_tf_target_de_da[['TF', 'gene']].drop_duplicates()
+        
+        # Remove autoregulation
+        self.grn_e18 = grn_group2_all[
+            grn_group2_all['TF'] != grn_group2_all['gene']
+        ].reset_index(drop=True)
+        
+        # ------------------
+        # Summary
+        # ------------------
+        print("\n" + "=" * 80)
+        print("FINAL GRN SUMMARY")
+        print("=" * 80)
+        print(
+            f"{self.group1} GRN: {len(self.grn_e14)} edges, "
+            f"{self.grn_e14['TF'].nunique()} TFs, "
+            f"{self.grn_e14['gene'].nunique()} targets"
+        )
+        print(
+            f"{self.group2} GRN: {len(self.grn_e18)} edges, "
+            f"{self.grn_e18['TF'].nunique()} TFs, "
+            f"{self.grn_e18['gene'].nunique()} targets"
+        )
+        
+        # Store for inspection
+        self.group1_active_elements = group1_active_elements
+        self.group2_active_elements = group2_active_elements
+        return self.grn_e14, self.grn_e18
+        
+    def save_grns(self):
+        """Save condition-specific GRNs."""
+        e14_path = os.path.join(self.output_dir, 'grn_e14.csv')
+        e18_path = os.path.join(self.output_dir, 'grn_e18.csv')
+        
+        self.grn_e14.to_csv(e14_path, index=False)
+        self.grn_e18.to_csv(e18_path, index=False)
+        
+        print(f"\nSaved:")
+        print(f"  {e14_path}")
+        print(f"  {e18_path}")
+
+
+
     
     def compute_element_zscores_parallel(self, 
                                         all_e14_peak_files, all_e18_peak_files,  # Global distribution
