@@ -105,14 +105,14 @@ class NetworkAnalyzer:
         # Better layout with more separation
         pos = nx.spring_layout(
             H, 
-            k=3,              # Increase separation
+            k=2,              # Increase separation
             iterations=100,   # More iterations for better layout
             seed=42
         )
         
         # Node sizes based on degree
         out_deg = dict(self.G.out_degree())
-        node_sizes = [500 + out_deg.get(node, 0) * 50 for node in H.nodes()]
+        node_sizes = [1000 + out_deg.get(node, 0) * 50 for node in H.nodes()]
         
         # Draw edges with transparency
         nx.draw_networkx_edges(
@@ -120,7 +120,7 @@ class NetworkAnalyzer:
             edge_color='#333333',  # Dark gray
             alpha=0.2,             # Much lighter/transparent
             arrows=True,
-            arrowsize=15,
+            arrowsize=7.5,
             width=0.8,             # Thinner edges
             connectionstyle='arc3,rad=0.1'  # Curved edges to reduce overlap
         )
@@ -138,7 +138,7 @@ class NetworkAnalyzer:
         # Draw labels
         nx.draw_networkx_labels(
             H, pos,
-            font_size=8,
+            font_size=12,
             font_weight='bold',
             font_color='black'
         )
@@ -165,3 +165,83 @@ class NetworkAnalyzer:
             print("\nSample TF-TF edges:")
             print(tf_tf_edges.head(10))
         return tf_tf_edges 
+    
+    def get_tf_tf_network(self, tf_symbols, grn_e14):
+        # tf_symbols = list(nsc.tf_symbols)
+        tf_symbols = [i.upper() for i in tf_symbols]
+        grn_e14['gene'] = [i.upper() for i in grn_e14['gene'].tolist()]
+        tf_tf_grn_e14 = grn_e14[(grn_e14['gene'].isin(tf_symbols)) & (grn_e14['TF'] != grn_e14['gene'])]
+
+        # grn_e18['gene'] = [i.upper() for i in grn_e18['gene'].tolist()]
+        # tf_tf_grn_e18 = grn_e18[(grn_e18['gene'].isin(tf_symbols)) & (grn_e18['TF'] != grn_e18['gene'])]
+        return tf_tf_grn_e14
+    
+    def annotate_patterning_factors(grn_df, patterning_factors, tf_col='TF', gene_col='gene'):
+        """
+        Add columns indicating if TF or target is a patterning factor.
+        
+        Args:
+            grn_df: DataFrame with GRN edges (columns: TF, gene, ...)
+            patterning_factors: List of TF names to mark
+            tf_col: Column name for TFs (default: 'TF')
+            gene_col: Column name for target genes (default: 'gene')
+        
+        Returns:
+            GRN DataFrame with added columns: 'TF_is_patterning', 'target_is_patterning'
+        """
+        # Convert to uppercase for case-insensitive matching
+        patterning_set = set([pf.upper() for pf in patterning_factors])
+        
+        print(f"\nAnnotating GRN with patterning factors...")
+        print(f"Total edges: {len(grn_df)}")
+        print(f"Patterning factors to mark: {len(patterning_factors)}")
+        
+        # Add boolean columns
+        grn_df['TF_is_patterning'] = grn_df[tf_col].str.upper().isin(patterning_set)
+        grn_df['target_is_patterning'] = grn_df[gene_col].str.upper().isin(patterning_set)
+        
+        # Statistics
+        tf_patterning_count = grn_df['TF_is_patterning'].sum()
+        target_patterning_count = grn_df['target_is_patterning'].sum()
+        both_patterning_count = (grn_df['TF_is_patterning'] & grn_df['target_is_patterning']).sum()
+        either_patterning_count = (grn_df['TF_is_patterning'] | grn_df['target_is_patterning']).sum()
+        
+        print(f"\nEdges where TF is patterning factor: {tf_patterning_count} ({tf_patterning_count/len(grn_df)*100:.1f}%)")
+        print(f"Edges where target is patterning factor: {target_patterning_count} ({target_patterning_count/len(grn_df)*100:.1f}%)")
+        print(f"Edges where both are patterning factors: {both_patterning_count}")
+        print(f"Edges involving any patterning factor: {either_patterning_count} ({either_patterning_count/len(grn_df)*100:.1f}%)")
+        
+        # Show which patterning factors were found
+        found_tfs = set(grn_df[grn_df['TF_is_patterning']][tf_col].str.upper())
+        found_genes = set(grn_df[grn_df['target_is_patterning']][gene_col].str.upper())
+        
+        print(f"\nPatterning factors found as TFs: {len(found_tfs)}")
+        if found_tfs:
+            print(f"  {sorted(found_tfs)}")
+        
+        print(f"Patterning factors found as targets: {len(found_genes)}")
+        if found_genes:
+            print(f"  {sorted(found_genes)}")
+        
+        # Show any patterning factors NOT found in the GRN
+        not_found = patterning_set - found_tfs - found_genes
+        if not_found:
+            print(f"\nPatterning factors NOT found in GRN: {sorted(not_found)}")
+        
+        return grn_df
+
+
+# # # Example usage:
+# # patterning_factors = ['PAX6', 'EMX2', 'NKX2-1', 'GSX2', 'DLX1', 'DLX2']
+
+# # Annotate E14 GRN
+# grn_builder.grn_e14 = annotate_patterning_factors(
+#     grn_builder.grn_e14, 
+#     patterning_factors
+# )
+
+# # Annotate E18 GRN
+# grn_builder.grn_e18 = annotate_patterning_factors(
+#     grn_builder.grn_e18,
+#     patterning_factors
+)
