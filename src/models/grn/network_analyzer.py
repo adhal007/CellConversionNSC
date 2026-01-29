@@ -244,4 +244,4 @@ class NetworkAnalyzer:
 # grn_builder.grn_e18 = annotate_patterning_factors(
 #     grn_builder.grn_e18,
 #     patterning_factors
-)
+# )
